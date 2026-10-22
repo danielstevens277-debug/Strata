@@ -122,7 +122,7 @@ def intel_gpus():
                 if card.get("free_memory_supported") is not True:
                     S.fail("native Intel GPU free VRAM query is unavailable (ext_intel_free_memory)",
                            "rebuild the native engine and check the Intel GPU driver and oneAPI runtime")
-                if card.get("command_graph_supported") is not True:
+                if card.get("command_graph_supported") is not True and card.get("devid") not in ALCHEMIST_IDS:
                     S.fail("native Intel GPU command graphs are unavailable (ext_oneapi_graph)",
                            "rebuild the native engine and check the Intel GPU driver and oneAPI runtime")
             return cards

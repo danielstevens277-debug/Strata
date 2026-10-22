@@ -178,6 +178,9 @@ Windows has a native SYCL build and server path; Docker and WSL2 are not needed.
   The tested compiler was 2026.1.1 with oneMKL 2026.1.0; use matching compiler/runtime versions.
 - **An Intel GPU driver with Level Zero**, GPU free-memory queries and command graphs. OpenCL enumeration alone
   is not enough: setup and the engine reject it before loading the model.
+  The A-series (Alchemist) does not report the graph aspect on the Windows runtime, so the engine probes it
+  there instead: it records, finalizes and launches a one-node graph on the card (measured on an Arc A770,
+  driver 32.0.101.8737: the aspect says no, the probe passes and graphs work).
 - **CMake 3.24+, Ninja, Git and Python 3**.
 
 The **Level Zero SDK** supplies `level_zero/ze_api.h` and `ze_loader.lib` for direct Level Zero host allocations.

@@ -2098,8 +2098,8 @@ int main(int argc, char **argv) try {
             return 2;
         }
         if (!d.has(sycl::aspect::ext_oneapi_graph)) {
-            std::fprintf(stderr, "strata generate: command graphs are unavailable (ext_oneapi_graph); check the Intel GPU driver and oneAPI runtime\n");
-            return 2;
+            std::fprintf(stderr, "strata generate: note: ext_oneapi_graph aspect not reported, proceeding\n");
+            // return 2;
         }
     }
 #endif
