@@ -1,19 +1,12 @@
 // src/core/gguf_expert_source.cpp - see the header. Plain C++, no device code.
 #include "strata/core/gguf_expert_source.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
+#include "strata/positioned_file.hpp"
 
 #include <algorithm>
 #include <atomic>
 #include <cstring>
 #include <utility>
-#ifdef _WIN32
-#define NOMINMAX
-#include <windows.h>
-#include <filesystem>
-#else
-#include <fcntl.h>
-#include <unistd.h>
-#endif
 #include <dpct/dpct.hpp>
 #include <sycl/sycl.hpp>
 #include <thread>
@@ -22,24 +15,6 @@ namespace strata::core {
 
 namespace {
 constexpr size_t kRing = 512;   // blobs alive at once: the prompt path holds a layer's worth of streamed experts
-int64_t read_at(intptr_t fd, uint8_t* dst, size_t bytes, uint64_t offset) {
-#ifdef _WIN32
-    OVERLAPPED ov{};
-    ov.Offset = static_cast<DWORD>(offset);
-    ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ov.hEvent) return -1;
-    DWORD got = 0;
-    const DWORD want = static_cast<DWORD>(std::min<size_t>(bytes, MAXDWORD));
-    BOOL ok = ReadFile(reinterpret_cast<HANDLE>(fd), dst, want, &got, &ov);
-    if (!ok && GetLastError() == ERROR_IO_PENDING)
-        ok = GetOverlappedResult(reinterpret_cast<HANDLE>(fd), &ov, &got, TRUE);
-    CloseHandle(ov.hEvent);
-    return ok ? static_cast<int64_t>(got) : -1;
-#else
-    return ::pread(static_cast<int>(fd), dst, bytes, static_cast<off_t>(offset));
-#endif
-}
 }
 
 GgufExpertSource::~GgufExpertSource() { close(); }
@@ -48,13 +23,8 @@ void GgufExpertSource::close() {
     for (uint8_t* c : mirror_chunks_) if (c) sycl::free(c, dpct::get_in_order_queue());
     mirror_chunks_.clear();
     mirror_bytes_ = 0; mirror_ptr_.clear(); layer_first_.clear();
-    for (intptr_t fd : fds_) if (fd != -1) {
-#ifdef _WIN32
-        CloseHandle(reinterpret_cast<HANDLE>(fd));
-#else
-        ::close(static_cast<int>(fd));
-#endif
-    }
+    for (intptr_t fd : fds_) if (fd != -1)
+        platform::close_positioned(reinterpret_cast<platform::PositionedHandle>(fd));
     fds_.clear(); names_.clear(); layer_fd_.clear(); ring_.clear(); ring_key_.clear(); where_.clear();
     ring_next_ = 0;
 }
@@ -99,10 +69,9 @@ intptr_t GgufExpertSource::fd_of(int64_t layer, int role, std::string& err) {
     for (size_t k = 0; k < names_.size(); ++k)
         if (names_[k] == name) { layer_fd_[i] = (int) k; return fds_[k]; }
 #ifdef _WIN32
-    const intptr_t fd = reinterpret_cast<intptr_t>(CreateFileW(std::filesystem::u8path(name).c_str(),
-        GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr));
+    const intptr_t fd = reinterpret_cast<intptr_t>(platform::open_positioned(name));
 #else
-    const intptr_t fd = ::open(name.c_str(), O_RDONLY | O_CLOEXEC);
+    const intptr_t fd = platform::open_positioned(name);
 #endif
     if (fd == -1) { err = "--stream-experts: cannot open " + name; return -1; }
     names_.push_back(name);
@@ -141,7 +110,7 @@ const uint8_t* GgufExpertSource::blob(int64_t layer, int64_t expert) {
         const uint64_t src = lay.gguf_off[(size_t) (3 * layer + r)] + per[r] * (uint64_t) expert;
         uint64_t done = 0;
         while (done < per[r]) {
-            const int64_t n = read_at(fd, buf.data() + at[r] + done, (size_t) (per[r] - done), src + done);
+            const int64_t n = platform::read_positioned(reinterpret_cast<platform::PositionedHandle>(fd), buf.data() + at[r] + done, (size_t) (per[r] - done), src + done);
             if (n <= 0) { std::lock_guard<std::mutex> lk(mu_); where_.erase(key); ring_key_[slot] = -1; return nullptr; }
             done += (uint64_t) n;
         }
@@ -263,7 +232,7 @@ bool GgufExpertSource::read_into(int64_t layer, int64_t expert, uint8_t* dst, si
         const uint64_t src = lay.gguf_off[(size_t) (3 * layer + r)] + per[r] * (uint64_t) expert;
         uint64_t done = 0;
         while (done < per[r]) {
-            const int64_t n = read_at(fd, dst + at[r] + done, (size_t) (per[r] - done), src + done);
+            const int64_t n = platform::read_positioned(reinterpret_cast<platform::PositionedHandle>(fd), dst + at[r] + done, (size_t) (per[r] - done), src + done);
             if (n <= 0) return false;
             done += (uint64_t) n;
         }
