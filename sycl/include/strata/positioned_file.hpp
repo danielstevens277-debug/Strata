@@ -26,6 +26,19 @@
 
 namespace strata::platform {
 #ifdef _WIN32
+namespace detail {
+// One event per thread, reused.  A cold start issues tens of thousands of reads (the expert-cache fill and the
+// host mirror), and CreateEventW/CloseHandle is a kernel object allocation and a handle-table update per read.
+// Manual-reset, ResetEvent before each request; the thread_local destructor closes it at thread exit.
+struct ThreadEvent {
+    HANDLE h = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    ~ThreadEvent() { if (h != nullptr) CloseHandle(h); }
+};
+inline HANDLE thread_event() {
+    thread_local ThreadEvent e;
+    return e.h;
+}
+}  // namespace detail
 using PositionedHandle = HANDLE;
 inline PositionedHandle invalid_positioned_handle() { return INVALID_HANDLE_VALUE; }
 inline PositionedHandle open_positioned(const std::string& path) {
@@ -37,8 +50,8 @@ inline int64_t read_positioned(PositionedHandle h, void* dst, size_t bytes, uint
     OVERLAPPED ov{};
     ov.Offset = static_cast<DWORD>(offset);
     ov.OffsetHigh = static_cast<DWORD>(offset >> 32);
-    ov.hEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
-    if (!ov.hEvent) return -1;
+    ov.hEvent = detail::thread_event();
+    if (ov.hEvent == nullptr || !ResetEvent(ov.hEvent)) return -1;
     DWORD got = 0;
     BOOL ok = ReadFile(h, dst, static_cast<DWORD>(std::min<size_t>(bytes, MAXDWORD)), &got, &ov);
     DWORD error = ok ? ERROR_SUCCESS : GetLastError();
@@ -46,7 +59,6 @@ inline int64_t read_positioned(PositionedHandle h, void* dst, size_t bytes, uint
         ok = GetOverlappedResult(h, &ov, &got, TRUE);
         error = ok ? ERROR_SUCCESS : GetLastError();
     }
-    CloseHandle(ov.hEvent);
     return ok ? static_cast<int64_t>(got) : error == ERROR_HANDLE_EOF ? 0 : -1;
 }
 #else

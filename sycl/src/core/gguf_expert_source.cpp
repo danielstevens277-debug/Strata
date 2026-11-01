@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdlib>
 #include <cstring>
 #include <utility>
 #include <dpct/dpct.hpp>
@@ -132,6 +133,16 @@ int64_t GgufExpertSource::mirror(const std::vector<std::pair<int64_t, int64_t>>&
         total += b;
     }
     if (take.empty()) return 0;
+    // The mirror is the largest file read of a start on a card that cannot hold the model (a 16 GB A770 keeps
+    // roughly half of Coder IQ1_M here).  `take` is in profile order, which scatters ~2.7 MB reads over the shards;
+    // read it in file order instead, as the profile fill already does (generate.cpp, "file order: each tensor read
+    // front to back").  The cap was applied above, so the same experts are mirrored; only the read and host-buffer
+    // order changes.  STRATA_MIRROR_PROFILE_ORDER=1 keeps the old order for an A/B.
+    const char* profile_order = std::getenv("STRATA_MIRROR_PROFILE_ORDER");
+    if (!(profile_order != nullptr && profile_order[0] == '1'))
+        std::sort(take.begin(), take.end(), [](const auto& a, const auto& b) {
+            return a.first != b.first ? a.first < b.first : a.second < b.second;
+        });
     // Alchemist (Arc A-series) refuses a single USM host allocation past ~3 GiB (docs/INTEL.md, A750), so the mirror
     // is built from chunks under that. Battlemage and the CUDA/HIP builds never hit the limit, but chunking is neutral
     // for them. One chunk per (up to) 2 GiB of experts.

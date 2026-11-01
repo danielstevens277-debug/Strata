@@ -666,6 +666,15 @@ private:
     const uint8_t* complement_device_ = nullptr;
     uint64_t complement_bytes_ = 0;
     std::vector<uint64_t> complement_offsets_;
+    // The resident complement as device-addressable USM-host chunks.  One allocation is refused past ~3 GiB on an
+    // Arc A-series card (the same limit GgufExpertSource::mirror avoids with 2 GiB chunks), so a chunked complement
+    // is what makes --pcie-frac possible at all on those cards.  Empty when a single block (or pageable fallback)
+    // was used.
+    std::vector<void*> complement_chunks_;
+    std::vector<const uint8_t*> complement_chunk_host_, complement_chunk_device_;
+    std::vector<uint64_t> complement_chunk_off_, complement_chunk_len_;
+    std::vector<const uint8_t*> complement_host_ptr_, complement_device_ptr_;
+    bool complement_chunked_ = false;
     detail::ExchangeStorage exchange_storage_; // authoritative when active; original arenas still own memory
     bool complement_pinned_ = false;
     bool complement_partial_ = false;         ///< CS-T: only the first complement_pin_limit_ bytes are registered
