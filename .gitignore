@@ -95,3 +95,13 @@ node_modules/
 /build-spark/
 /build-vision-spark/
 /.venv-build/
+
+# One-off local runs: autotune output, crash dumps, saved sessions, build probes
+/.port-smoke/
+/.tmp-win.bat
+/autotune.py
+/omp-session-*
+/session.html
+/strata-stall-*.dmp
+/tuning_results.csv
+/tuning_runs.jsonl

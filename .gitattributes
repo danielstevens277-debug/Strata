@@ -1,3 +1,8 @@
+# Normalize line endings to LF in the repository for every text file.  Without this rule a Windows
+# checkout (core.autocrlf=false) writes CRLF into the working tree, and every text file reports as
+# modified while its content is byte-identical.  The rules below win where they apply: the
+# launchers keep their platform endings, and the -text entries below are hashed byte for byte.
+* text=auto
 # Frozen prompts are hashed byte for byte (manifest sha256): never convert their line endings.
 bench/prompts/** -text
 
@@ -28,3 +33,13 @@ docker/compose/* text eol=lf
 
 # vendored KaTeX (serve/web/vendor): the files are hashed byte for byte (PROVENANCE.json), never convert their line endings.
 serve/web/vendor/** -text
+
+# recorded community results and their task fixtures are reproduced byte for byte (a fixture counts as
+# benchmark input), and this file is generated: never convert their line endings
+bench/results/** -text
+data/gguf_fingerprints.json -text
+# the launch scripts recorded inside them are launchers too: they keep the rules above
+bench/results/**/*.bat text eol=crlf
+bench/results/**/*.cmd text eol=crlf
+bench/results/**/*.ps1 text eol=crlf
+bench/results/**/*.sh text eol=lf
