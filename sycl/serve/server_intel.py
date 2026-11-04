@@ -331,18 +331,23 @@ def install_two_card_spec():
     from strata_control import intel_spec
     original = S.engine_args
 
-    def engine_args(cfg):
-        args = original(cfg)
+    # The wrapper takes what serve/server.py's own engine_args takes, and forwards all of it: the server also calls it
+    # as engine_args(cfg, exe, announce=False) (warn_budget_over_ram, #1080, and mtp_retry_args), and a wrapper of (cfg)
+    # alone stopped the server on its first start - TypeError on `announce` (0.2.10; upstream's wrapper has the same gap).
+    def engine_args(cfg, exe=None, *, announce=True):
+        args = original(cfg, exe, announce=announce)
         try:
             if cfg.get("backend") == "sycl" and S.layer_split_of(cfg):
                 sysfs = intel_spec.sysfs_cards()
                 cards = [sysfs[i] for i in S.gpu_list(cfg) if isinstance(i, int) and 0 <= i < len(sysfs)]
                 new, note = intel_spec.plan(args, cfg.get("user_args"), cards, mtp_off=cfg.get("mtp") is False)
                 if note:
-                    print("[strata] " + note, flush=True)
+                    if announce:                 # announce=False is the probe/retry form: the args, but no line
+                        print("[strata] " + note, flush=True)
                     return new
         except Exception as exc:  # noqa: BLE001 - a rule that cannot be read leaves the config's own args
-            print(f"[strata] two-card --spec rule skipped: {exc}", flush=True)
+            if announce:
+                print(f"[strata] two-card --spec rule skipped: {exc}", flush=True)
         return args
     S.engine_args = engine_args
 

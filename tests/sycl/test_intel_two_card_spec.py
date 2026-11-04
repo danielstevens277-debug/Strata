@@ -132,7 +132,7 @@ def test_server_wrapper_applies_the_rule_at_start(monkeypatch):
     mod = _server_intel()
     S = mod.S
     seen = []
-    monkeypatch.setattr(S, "engine_args", lambda cfg: list(cfg["args"]))
+    monkeypatch.setattr(S, "engine_args", lambda cfg, exe=None, *, announce=True: list(cfg["args"]))
     monkeypatch.setattr(intel_spec, "sysfs_cards", lambda *a, **k: [dict(B65, index=0), dict(B65, index=1)])
     mod.install_two_card_spec()
     cfg = {"backend": "sycl", "gpu": [0, 1], "args": list(ARGS)}
@@ -145,10 +145,32 @@ def test_server_wrapper_applies_the_rule_at_start(monkeypatch):
     assert spec_of(S.engine_args({**cfg, "mtp": False})) == "4"
 
 
+def test_server_wrapper_takes_the_server_s_own_signature(monkeypatch):
+    """serve/server.py also calls engine_args(cfg, exe, announce=False) - warn_budget_over_ram's #1080 check and the
+    mtp_retry_args probe - so the wrapper has to accept and forward both, or the first start dies with a TypeError
+    (0.2.10: the wrapper took cfg alone).  announce=False still gets the rule's args, it just says nothing."""
+    mod = _server_intel()
+    S = mod.S
+    seen = []
+
+    def inner(cfg, exe=None, *, announce=True):
+        seen.append((exe, announce))
+        return list(cfg["args"])
+
+    monkeypatch.setattr(S, "engine_args", inner)
+    monkeypatch.setattr(intel_spec, "sysfs_cards", lambda *a, **k: [dict(B65, index=0), dict(B65, index=1)])
+    mod.install_two_card_spec()
+    cfg = {"backend": "sycl", "gpu": [0, 1], "args": list(ARGS)}
+    assert spec_of(S.engine_args(cfg, "strata.exe", announce=False)) == "2"      # the rule still applies
+    assert spec_of(S.engine_args(cfg, "strata.exe")) == "2"
+    assert spec_of(S.engine_args(cfg)) == "2"                                    # exe omitted, as the launcher does
+    assert seen == [("strata.exe", False), ("strata.exe", True), (None, True)]
+
+
 def test_server_wrapper_one_a_series_card_stays(monkeypatch):
     mod = _server_intel()
     S = mod.S
-    monkeypatch.setattr(S, "engine_args", lambda cfg: list(cfg["args"]))
+    monkeypatch.setattr(S, "engine_args", lambda cfg, exe=None, *, announce=True: list(cfg["args"]))
     monkeypatch.setattr(intel_spec, "sysfs_cards", lambda *a, **k: [dict(B65, index=0), dict(A750, index=1)])
     mod.install_two_card_spec()
     cfg = {"backend": "sycl", "gpu": [0, 1], "args": list(ARGS)}
