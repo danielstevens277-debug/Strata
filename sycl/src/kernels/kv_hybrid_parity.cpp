@@ -17,6 +17,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/sycl_queue.hpp"   // intel_gpu_gen: which card is asking for the prompt-attn arm
 
 #include <algorithm>
 #include <cmath>
@@ -451,6 +452,24 @@ int main() {
 #if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
             std::printf("[5/5] qsa_prompt_attn mode 3: PASS (refused on HIP - the old kernel runs)\n");
+#elif defined(SYCL_LANGUAGE_VERSION)
+            // SYCL: the same contract, for two reasons that are properties of the cards rather than defects.  The
+            // ESIMD arm is Battlemage-only (`intel_gpu_gen != Battlemage` refuses, and an A770 is Alchemist), and
+            // the XMX arm is OPT-IN (`STRATA_PROMPT_ATTN_XMX`, default 0).  So on an Alchemist with the arm unset a
+            // refusal is the designed answer and the old kernel runs; a refusal AFTER asking for the arm is a real
+            // failure.  Asking is checked rather than assumed, because otherwise the arm could rot unnoticed.
+            const char* arm = std::getenv("STRATA_PROMPT_ATTN_XMX");
+            const bool asked = arm != nullptr && std::atoi(arm) != 0;
+            const auto gen = strata::intel_gpu_gen(dpct::get_in_order_queue().get_device());
+            if (!asked && gen != strata::IntelGpuGen::Battlemage) {
+                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (no arm on this card: ESIMD is Battlemage-only, "
+                            "XMX is opt-in - the old kernel runs)\n");
+            } else {
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (asked: XMX=%s, gen=%s - refused the hybrid pools)\n",
+                            asked ? arm : "unset",
+                            gen == strata::IntelGpuGen::Battlemage ? "battlemage" : "alchemist");
+                g_fail = 1;
+            }
 #else
             std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (refused the hybrid pools)\n");
             g_fail = 1;
