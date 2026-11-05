@@ -54,6 +54,7 @@
 
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/rope.hpp"
+#include "strata/sycl_queue.hpp"   // fp64_kernels_ok: the indexer accumulator follows the card
 
 #include <algorithm>
 #include <cmath>
@@ -145,6 +146,19 @@ void verdict(const std::string& name, bool ok, const std::string& detail = "") {
 }
 void report(const std::string& name, double v, const char* unit) {
     std::printf("  %-48s %s %.3e\n", name.c_str(), unit, v);
+}
+/// Distance between two floats in ULPs, by the ordering trick: map the sign-magnitude bits onto a monotone
+/// int32 so that `+0.0` and `-0.0` are adjacent and the count is the number of representable floats between them.
+long long ulp_diff(float a, float b) {
+    if (a == b) return 0;
+    if (std::isnan(a) || std::isnan(b)) return (1LL << 40);
+    uint32_t ia, ib;
+    std::memcpy(&ia, &a, 4);
+    std::memcpy(&ib, &b, 4);
+    auto ord = [](uint32_t u) {
+        return (int64_t) (u & 0x80000000u ? -(int32_t) (u & 0x7FFFFFFFu) : (int32_t) u);
+    };
+    return std::llabs((long long) ord(ia) - (long long) ord(ib));
 }
 void require(const std::string& name, bool ok, const std::string& detail = "") {
     std::printf("  %-48s %-6s %s\n", name.c_str(), ok ? "ok" : "*** BAD ***", detail.c_str());
@@ -604,13 +618,25 @@ int main(int argc, char** argv) {
         const std::vector<double> want = ref_pooled(rc, w_kn, EPS, (int) S.n_rot, THETA, Alt{}, &terms);
         const std::vector<double> want_raw = ref_pooled_raw(rc);
 
-        // (a) the spare slot: BIT-EXACT, because rope at position 0 is the identity in both (cos = 1, sin = 0
-        //     exactly), so the residual the pooled rows carry from the f32 rope cannot appear here.
+        // (a) the spare slot: BIT-EXACT WHEN THE ACCUMULATOR IS DOUBLE, because rope at position 0 is the
+        //     identity in both (cos = 1, sin = 0 exactly), so the residual the pooled rows carry from the f32
+        //     rope cannot appear here - what is left is the reduction, and that is the ACC's own width.  On an
+        //     Alchemist the indexer's ACC is `float` (see `fp64_kernels_ok`), so the honest bar is a couple of
+        //     ulps rather than equality: the reference reduces in f64 and the kernel cannot.
+        const bool f64 = strata::fp64_kernels_ok(dpct::get_in_order_queue().get_device());
         int dead_bad = 0;
-        for (int64_t d = 0; d < IDXD; ++d)
-            if (got_dead[(size_t) d] != (float) want[(size_t) n_bid * IDXD + d]) ++dead_bad;
-        require("the spare slot's key (rms_norm of cell 0) is BIT-EXACT", dead_bad == 0,
-                std::to_string(dead_bad) + " of " + std::to_string(IDXD) + " wrong");
+        long long dead_worst_ulp = 0;
+        for (int64_t d = 0; d < IDXD; ++d) {
+            const float ref_f = (float) want[(size_t) n_bid * IDXD + d];
+            const long long u = ulp_diff(got_dead[(size_t) d], ref_f);
+            dead_worst_ulp = std::max(dead_worst_ulp, u);
+            if (u > (f64 ? 0 : 2)) ++dead_bad;
+        }
+        require(f64 ? "the spare slot's key (rms_norm of cell 0) is BIT-EXACT"
+                    : "the spare slot's key is within 2 ulp of the f64 reference",
+                dead_bad == 0,
+                std::to_string(dead_bad) + " of " + std::to_string(IDXD) + " wrong (worst " +
+                    std::to_string(dead_worst_ulp) + " ulp, " + (f64 ? "double" : "float") + " accumulator)");
         require("the spare slot is at row n_bid and nowhere else", n_bid == 2,
                 "10 cells / r=4 -> 2 complete blocks");
 
@@ -625,8 +651,15 @@ int main(int argc, char** argv) {
                 const double tm = terms[(size_t) b * IDXD + d];
                 worst = std::max(worst, rel_terms(wv, (double) got[(size_t) b * IDXD + d], tm));
             }
+        // The 1e-6 bar was written against the double instantiation.  A float ACC adds one rounding per term of
+        // the four-cell mean and one in the norm - 2**-24 each, against a divisor of the rope's own terms - so the
+        // budget follows the same switch the kernel makes rather than pretending the fp64 reduction ran.
+        const double pooled_tol = f64 ? 1e-6 : 1e-5;
         report("pooled block keys vs the reference", worst, "rel/|rope terms|");
-        if (!(worst <= 1e-6)) { std::printf("    *** over 1e-6 ***\n"); ++g_bad; }
+        if (!(worst <= pooled_tol)) {
+            std::printf("    *** over %.0e (%s accumulator) ***\n", pooled_tol, f64 ? "double" : "float");
+            ++g_bad;
+        }
 
         // (c) THE INCOMPLETE TAIL IS NOT POOLED: the two tail cells take the SPARE slot's score, which is cell
         //     0's key - not their own mean.  A rival reading that pools them would still fill every row.
