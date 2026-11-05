@@ -146,14 +146,24 @@ __dpct_inline__ void gdn_conv_kernel(float *__restrict__ cs,
 /// The sum is accumulated in DOUBLE, as `ref/gdn.py` does (`l2_norm(q.astype(np.float64), eps)`), because the
 /// reference deliberately computes this one in float64 and then casts - so matching its precision is part of
 /// transcribing it.
+///
+/// **THE ACCUMULATOR IS A TEMPLATE PARAMETER BECAUSE ALCHEMIST HAS NO FP64.**  An Arc A-series card (the A770)
+/// has no FP64 units, and IGC does not merely emulate the arithmetic slowly there: it REFUSES THE BUILD of this
+/// kernel outright - "Double type is not supported on this platform" - because the sum lives in `double`-typed
+/// local memory and crosses a subgroup shuffle, neither of which the emulation covers.  With
+/// IGC_EnableDPEmulation=1 the rest of the tree runs, so this kernel alone made every GDN layer unavailable on
+/// the card.  The double instantiation stays for cards that have FP64 (it is bitwise with the reference); a card
+/// without it launches the float one, whose relative error on rows up to 1024 wide stays inside gdn_parity's
+/// 1e-6 gate.
+template <typename ACC>
 __dpct_inline__ void gdn_l2_kernel(float *__restrict__ x, int cols, float eps) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int row = item_ct1.get_group(2);
     float* p = x + (size_t) row * cols;
-    double acc = 0.0;
+    ACC acc = (ACC) 0.0;
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < cols;
-         i += item_ct1.get_local_range(2)) acc += (double)p[i] * (double)p[i];
+         i += item_ct1.get_local_range(2)) acc += (ACC) p[i] * (ACC) p[i];
     // warp reduction
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
@@ -165,7 +175,7 @@ runtimes. You may need to adjust the code.
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             acc, off);
-    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
+    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<ACC>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     if (item_ct1.get_local_id(2) == 0) ssum = acc;
     /*
@@ -174,13 +184,14 @@ runtimes. You may need to adjust the code.
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    const float inv = (float)(1.0 / sycl::sqrt(ssum + (double)eps));
+    const float inv = (float) (1.0 / sycl::sqrt(ssum + (ACC) eps));
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < cols;
          i += item_ct1.get_local_range(2)) p[i] *= inv;
 }
 
 /// y = rms_norm(o, eps) * ssm_norm * sigmoid(z), one warp per head, norm over that head's S values.
+template <typename ACC>
 __dpct_inline__ void gdn_out_norm_kernel(const float *__restrict__ o,
                                          const float *__restrict__ z,
                                          const float *__restrict__ ssm_norm,
@@ -191,10 +202,10 @@ __dpct_inline__ void gdn_out_norm_kernel(const float *__restrict__ o,
     const float* po = o + (size_t) h * S;
     const float* pz = z + (size_t) h * S;
     float* py = y + (size_t) h * S;
-    double acc = 0.0;
+    ACC acc = (ACC) 0.0;
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < S;
-         i += item_ct1.get_local_range(2)) acc += (double)po[i] * (double)po[i];
+         i += item_ct1.get_local_range(2)) acc += (ACC) po[i] * (ACC) po[i];
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -205,16 +216,27 @@ runtimes. You may need to adjust the code.
         dpct::experimental::shift_sub_group_left(
             0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(),
             acc, off);
-    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
+    auto &ssum = *sycl::ext::oneapi::group_local_memory_for_overwrite<ACC>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     if (item_ct1.get_local_id(2) == 0) ssum = acc;
     item_ct1.barrier(sycl::access::fence_space::local_space);
-    const float inv = (float)(1.0 / sycl::sqrt(ssum / (double)S + (double)eps));
+    const float inv = (float) (1.0 / sycl::sqrt(ssum / (ACC) S + (ACC) eps));
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < S;
          i += item_ct1.get_local_range(2))
         py[i] = po[i] * inv * ssm_norm[i] * sigmoid_f(pz[i]);
 }
+
+/// The two accumulator widths the launchers choose between.  Distinct kernel names, because each is a separate
+/// device image: on a card without FP64 the double one is never launched and so never built.
+__dpct_inline__ void gdn_l2_kernel_f64(float *__restrict__ x, int cols, float eps) { gdn_l2_kernel<double>(x, cols, eps); }
+__dpct_inline__ void gdn_l2_kernel_f32(float *__restrict__ x, int cols, float eps) { gdn_l2_kernel<float>(x, cols, eps); }
+__dpct_inline__ void gdn_out_norm_kernel_f64(const float *__restrict__ o, const float *__restrict__ z,
+                                             const float *__restrict__ ssm_norm, float *__restrict__ y, int S,
+                                             float eps) { gdn_out_norm_kernel<double>(o, z, ssm_norm, y, S, eps); }
+__dpct_inline__ void gdn_out_norm_kernel_f32(const float *__restrict__ o, const float *__restrict__ z,
+                                             const float *__restrict__ ssm_norm, float *__restrict__ y, int S,
+                                             float eps) { gdn_out_norm_kernel<float>(o, z, ssm_norm, y, S, eps); }
 
 }  // namespace
 
@@ -293,20 +315,24 @@ void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<dpct_kernel_name<class gdn_l2_kernel_fcfb3d>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)rows) *
-                                      sycl::range(1, 1, 32),
-                                  sycl::range(1, 1, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gdn_l2_kernel(x, (int)cols, eps);
+        // FP64 where the card has it (bitwise with the reference), the float accumulator where it does not.
+        // Asking `has_capability_or_fail` for FP64 is what aborted every GDN run on an A770: the aspect is
+        // absent there and the check calls std::terminate, so the float path below never existed.
+        const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned) rows) * sycl::range(1, 1, 32),
+                                    sycl::range(1, 1, 32));
+        if (strata::q_of(stream)->get_device().has(sycl::aspect::fp64)) {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class gdn_l2_kernel_fcfb3d_f64>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                        gdn_l2_kernel_f64(x, (int) cols, eps);
                     });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class gdn_l2_kernel_fcfb3d_f32>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                        gdn_l2_kernel_f32(x, (int) cols, eps);
+                    });
+        }
     }
     if (stream == nullptr) {
         const dpct::err0 e = DPCT_CHECK_ERROR(
@@ -373,20 +399,21 @@ void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<dpct_kernel_name<class gdn_out_norm_kernel_9883e0>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)h_v) *
-                                      sycl::range(1, 1, 32),
-                                  sycl::range(1, 1, 32)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        gdn_out_norm_kernel(o, z, ssm_norm, y, (int)S, eps);
+        const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned) h_v) * sycl::range(1, 1, 32),
+                                    sycl::range(1, 1, 32));
+        if (strata::q_of(stream)->get_device().has(sycl::aspect::fp64)) {   // see gdn_l2_norm
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class gdn_out_norm_kernel_9883e0_f64>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                        gdn_out_norm_kernel_f64(o, z, ssm_norm, y, (int) S, eps);
                     });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class gdn_out_norm_kernel_9883e0_f32>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                        gdn_out_norm_kernel_f32(o, z, ssm_norm, y, (int) S, eps);
+                    });
+        }
     }
     if (stream == nullptr) {
         const dpct::err0 e = DPCT_CHECK_ERROR(
