@@ -790,7 +790,6 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
             ->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range(smem), cgh);
-                                .get();
                 const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned)n_tokens) *
                                                 sycl::range(1, 1, threads),
                                             sycl::range(1, 1, threads));
