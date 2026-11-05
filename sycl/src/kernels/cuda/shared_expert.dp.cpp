@@ -54,6 +54,7 @@ bool native_bf16 = false;
 
 // silu(x) = x / (1 + exp(-x)), written as `ref/moe.py` writes it, in DOUBLE then cast - the reference works in
 // float64 and a float32 exp differs in the last bits.  The multiplication by `up` is the reference's order.
+template <typename ACC>
 __dpct_inline__ void swiglu_kernel(const float *__restrict__ gate,
                                    const float *__restrict__ up,
                                    float *__restrict__ out, int n) {
@@ -61,8 +62,8 @@ __dpct_inline__ void swiglu_kernel(const float *__restrict__ gate,
     const int i = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                   item_ct1.get_local_id(2);
     if (i >= n) return;
-    const double x = (double) gate[i];
-    out[i] = (float)(x / (1.0 + sycl::exp(-x))) * up[i];
+    const ACC x = (ACC) gate[i];
+    out[i] = (float)(x / ((ACC) 1 + sycl::exp(-x))) * up[i];
 }
 
 __dpct_inline__ void native_swiglu_kernel(const float *gate, const float *up,
@@ -113,7 +114,8 @@ void to_f16_kernel(const float* __restrict__ in, uint16_t* __restrict__ out, int
 //
 // A wrong scalar here is the quiet failure mode: sigmoid bounds the damage to [0,1], so a gate that should be
 // 0.5 and reads 1.0 scales the shared expert by 2x and produces perfectly finite, perfectly plausible logits.
-__dpct_inline__ double warp_sum_d(double v) {
+template <typename ACC>
+__dpct_inline__ ACC warp_sum_d(ACC v) {
     /*
 DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -141,18 +143,19 @@ function/algorithm is initialized.
         0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, 0);
 }
 
+template <typename ACC>
 __dpct_inline__ void scalar_gate_kernel(const uint16_t *__restrict__ x_bf16,
                                         const uint16_t *__restrict__ w_bf16,
                                         float *__restrict__ out, int n_embd) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
+auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<ACC[8]>(
     sycl::ext::oneapi::this_work_item::get_work_group<
         3>()); // 8 warps: the launch is <<<1, 256>>>
-    double acc = 0.0;
+    ACC acc = (ACC) 0;
 #pragma unroll
     for (int i = item_ct1.get_local_id(2); i < n_embd;
          i += item_ct1.get_local_range(2))
-        acc += (double) f32_from_bf16(x_bf16[i]) * (double) f32_from_bf16(w_bf16[i]);
+        acc += (ACC) f32_from_bf16(x_bf16[i]) * (ACC) f32_from_bf16(w_bf16[i]);
     item_ct1.barrier(sycl::access::fence_space::local_space);
     const int lane = item_ct1.get_local_id(2) & 31,
               warp = item_ct1.get_local_id(2) >> 5;
@@ -163,11 +166,22 @@ auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
     if (warp == 0) {
         acc = (item_ct1.get_local_id(2) < nw)
                   ? scratch[item_ct1.get_local_id(2)]
-                  : 0.0;
+                  : (ACC) 0;
         acc = warp_sum_d(acc);
         if (item_ct1.get_local_id(2) == 0) out[0] =
-            (float)(1.0 / (1.0 + sycl::exp(-acc)));
+            (float)((ACC) 1 / ((ACC) 1 + sycl::exp(-acc)));
     }
+}
+
+/// The two instantiations every launcher below chooses between (see `strata::fp64_kernels_ok`, and the comment
+/// on `gdn_l2_kernel` for why an Alchemist needs the float one at all).
+__dpct_inline__ void swiglu_kernel_f64(const float *g, const float *u, float *o, int n) { swiglu_kernel<double>(g, u, o, n); }
+__dpct_inline__ void swiglu_kernel_f32(const float *g, const float *u, float *o, int n) { swiglu_kernel<float>(g, u, o, n); }
+__dpct_inline__ void scalar_gate_kernel_f64(const uint16_t *x, const uint16_t *w, float *o, int n) {
+    scalar_gate_kernel<double>(x, w, o, n);
+}
+__dpct_inline__ void scalar_gate_kernel_f32(const uint16_t *x, const uint16_t *w, float *o, int n) {
+    scalar_gate_kernel<float>(x, w, o, n);
 }
 
 __dpct_inline__ void scale_kernel(float *__restrict__ out,
@@ -406,25 +420,27 @@ void shared_expert_multi(int n_tok, const float* x, const uint16_t* x_bf16, cons
             } else {
                 auto exp_props = sycl::ext::oneapi::experimental::properties{
                     sycl::ext::oneapi::experimental::use_root_sync};
-                dpct::has_capability_or_fail(cs->get_device(),
-                                             {sycl::aspect::fp64});
-
                 strata::kprof::kp(cs, __FILE__, __func__, __LINE__)->submit([&](sycl::handler &cgh) {
                     auto x_bf16_size_t_t_n_embd_ct0 =
                         x_bf16 + (size_t)t * n_embd;
                     auto g_t_ct2 = g + t;
 
-                    cgh.parallel_for<
-                        dpct_kernel_name<class scalar_gate_kernel_76bc5d>>(
-                        sycl::nd_range<3>(sycl::range(1, 1, 256),
-                                          sycl::range(1, 1, 256)),
-                        exp_props,
-                        [=](sycl::nd_item<3> item_ct1)
-                            [[sycl::reqd_sub_group_size(32)]] {
-                                scalar_gate_kernel(x_bf16_size_t_t_n_embd_ct0,
-                                                   gate_inp_bf16, g_t_ct2,
-                                                   (int)n_embd);
-                            });
+                    const sycl::nd_range<3> rng(sycl::range(1, 1, 256), sycl::range(1, 1, 256));
+                    if (strata::fp64_kernels_ok(cs->get_device())) {
+                        cgh.parallel_for<dpct_kernel_name<class scalar_gate_kernel_76bc5d_f64>>(
+                            rng, exp_props, [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    scalar_gate_kernel_f64(x_bf16_size_t_t_n_embd_ct0,
+                                                           gate_inp_bf16, g_t_ct2, (int)n_embd);
+                                });
+                    } else {
+                        cgh.parallel_for<dpct_kernel_name<class scalar_gate_kernel_76bc5d_f32>>(
+                            rng, exp_props, [=](sycl::nd_item<3> item_ct1)
+                                [[sycl::reqd_sub_group_size(32)]] {
+                                    scalar_gate_kernel_f32(x_bf16_size_t_t_n_embd_ct0,
+                                                           gate_inp_bf16, g_t_ct2, (int)n_embd);
+                                });
+                    }
                 });
             }
         }
@@ -565,18 +581,21 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
         } else {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(
-                strata::q_of(stream)->get_device(),
-                {sycl::aspect::fp64});
-
-            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-                ->template parallel_for<dpct_kernel_name<class swiglu_kernel_fbfcfe>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, g_ff) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        swiglu_kernel(gate, up, gate, (int)n_ff);
-                    });
+            const sycl::nd_range<3> rng(sycl::range(1, 1, g_ff) * sycl::range(1, 1, THREADS),
+                                        sycl::range(1, 1, THREADS));
+            if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+                strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                    ->template parallel_for<dpct_kernel_name<class swiglu_kernel_fbfcfe_f64>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            swiglu_kernel_f64(gate, up, gate, (int)n_ff);
+                        });
+            } else {
+                strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                    ->template parallel_for<dpct_kernel_name<class swiglu_kernel_fbfcfe_f32>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            swiglu_kernel_f32(gate, up, gate, (int)n_ff);
+                        });
+            }
         }
 
         // down: (n_ff) -> (n_embd), and THE INTERMEDIATE IS QUANTIZED TO THE DOWN WEIGHT'S OWN CONTRACT - which is
@@ -615,21 +634,22 @@ void shared_expert(const uint8_t *x_q8_0, const uint8_t *x_q8k,
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(
-                strata::q_of(stream)->get_device(),
-                {sycl::aspect::fp64});
-
-            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-                ->template parallel_for<
-                    dpct_kernel_name<class scalar_gate_kernel_82de77>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, 256),
-                                      sycl::range(1, 1, 256)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1)
-                        [[sycl::reqd_sub_group_size(32)]] {
-                            scalar_gate_kernel(x_bf16, gate_inp_bf16, g,
-                                               (int)n_embd);
-                        });
+            const sycl::nd_range<3> rng(sycl::range(1, 1, 256), sycl::range(1, 1, 256));
+            if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+                strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                    ->template parallel_for<dpct_kernel_name<class scalar_gate_kernel_82de77_f64>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                scalar_gate_kernel_f64(x_bf16, gate_inp_bf16, g, (int)n_embd);
+                            });
+            } else {
+                strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                    ->template parallel_for<dpct_kernel_name<class scalar_gate_kernel_82de77_f32>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1)
+                            [[sycl::reqd_sub_group_size(32)]] {
+                                scalar_gate_kernel_f32(x_bf16, gate_inp_bf16, g, (int)n_embd);
+                            });
+            }
         }
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
