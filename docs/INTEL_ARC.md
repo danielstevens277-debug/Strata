@@ -158,6 +158,39 @@ Things that matter on an Arc (details in [INTEL.md](INTEL.md)):
   any `STRATA_*`, `ONEAPI_*`, `UR_*`, `IGC_*`, `SYCL_*` or `ZES_*` variable of the server's environment reach the engine
   through `strata-sycl.sh`.
 
+## Alchemist (A-series) and FP64
+
+The port comes from CUDA, so a number of kernels reproduce `ref/*.py` arithmetic in `double` because numpy did. A
+Battlemage card builds all of them. An Arc A-series card (A750/A770) has no FP64 units, and IGC refuses some of those
+kernels outright - `Double type is not supported on this platform`. That is not slowness, it is a build failure, and it
+does not come back as a `sycl::exception` you can catch and work around: where a launch has no `try` above it, the
+process aborts. `IGC_EnableDPEmulation=1` covers the plain arithmetic, but not a double that lives in local memory or
+crosses a sub-group shuffle, which is exactly what a sum over a block does.
+
+`strata::fp64_kernels_ok(device)` (`sycl/include/strata/sycl_queue.hpp`) is the one place that answers the question, and
+it answers it from the **architecture id**, not from `aspect::fp64`: `OverrideDefaultFP64Settings=1`, which the A770
+launch configuration carries, makes the runtime *report* the fp64 aspect on a card that still cannot build the kernel.
+The kernels that need it therefore carry two instantiations, templated on the accumulator - `double` where the card has
+FP64 (bitwise with the reference, as before) and `float` on Alchemist:
+
+| kernel | state on an A770 |
+|---|---|
+| `silu_inplace` | float instantiation, rel 2.9e-8 vs the reference |
+| `gdn_l2_norm`, `gdn_out_norm` | float instantiation, rel 2.4-3.3e-8 |
+| `quantize_q8_0` | float instantiation, **byte-exact** - see below |
+| `router_top10` | **still double**, still a build failure |
+| `shared_expert` | **still double**, still a build failure |
+| `qsa` | **still double**, aborts part way through `qsa_parity` |
+
+The q8 activation quantiser keeps the reference's rounding without an FP64 unit. A 24-bit quotient can land exactly on
+`n+0.5` where the 53-bit reference still sees a hair, and `rint` then takes the tie to even and flips one q8 value (the
+first float version was exact except 1 byte in 21760). `fma(-q, d, x)` is the correctly rounded remainder, so its sign
+says which side of the tie the true quotient is on; a zero remainder is a genuine tie, where half-to-even is right
+anyway. `quantize_act_parity` is byte-exact with that.
+
+The remaining three are the same job, done the same way, with one caveat for the router: it decides *which experts run*,
+so its float path has to be checked against the double one on real routing decisions, not just element-wise.
+
 ## Tested cards
 
 > **Measured on:** the hardware in each row, Linux, apart from the one Windows row. Versions are the engine version of
