@@ -713,6 +713,7 @@ int main(int argc, char** argv) {
     // otherwise loses every line it had already printed, because stdout is block-buffered the moment it is redirected -
     // which is how these tests run.  The failure then reads as "no output at all", which hides what it was doing.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::printf("=== Running gr_parity test ===\n");
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
