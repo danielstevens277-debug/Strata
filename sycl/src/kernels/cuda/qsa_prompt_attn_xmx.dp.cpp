@@ -365,6 +365,8 @@ bool dispatch(const float* q, const QsaAttnPools& pools, const int32_t* ids, con
 }
 }  // namespace
 
+int64_t qsa_prompt_attn_xmx_min_local_bytes() { return (int64_t) Layout<32>::bytes; }
+
 bool qsa_prompt_attn_xmx(const float* q, const QsaAttnPools& pools, const int32_t* ids, const int32_t* steps, int64_t cap,
                          const QsaShapes& s, float* attn, int64_t n_q, void* stream) {
     // STRATA_PROMPT_ATTN_XMX=1 (64-cell chunks) or =32 (32-cell chunks); unset or 0: the caller's fallback
@@ -379,8 +381,19 @@ bool qsa_prompt_attn_xmx(const float* q, const QsaAttnPools& pools, const int32_
     static bool told = false;
     if (!told) {
         told = true;
-        std::fprintf(stderr, "strata: prompt attention on XMX, %d-cell chunks (%zu of %zu bytes of local memory)\n",
-                     ch64 ? 64 : 32, ch64 ? Layout<64>::bytes : Layout<32>::bytes, have);
+        if (!ch64 && have < Layout<32>::bytes) {
+            // NAME THE REFUSAL.  This is not a shape or a pool it does not handle: the smallest chunk does not fit in
+            // the card's local memory, so no arm value will ever make it run here (an A770: 65536 bytes of SLM against
+            // Layout<32>::bytes).  Printing the chunk size alone left the reader to work out which of the two numbers
+            // was the problem; saying so once is the difference between a fact and a mystery.
+            std::fprintf(stderr,
+                         "strata: prompt attention on XMX needs %zu bytes of local memory for its smallest\n"
+                         "        (32-cell) chunk, this GPU has %zu: the FP32 prompt kernel runs instead.\n",
+                         Layout<32>::bytes, have);
+        } else {
+            std::fprintf(stderr, "strata: prompt attention on XMX, %d-cell chunks (%zu of %zu bytes of local memory)\n",
+                         ch64 ? 64 : 32, ch64 ? Layout<64>::bytes : Layout<32>::bytes, have);
+        }
     }
     if (!ch64 && have < Layout<32>::bytes) return false;
     return ch64 ? dispatch<64>(q, pools, ids, steps, cap, s, attn, n_q, st)

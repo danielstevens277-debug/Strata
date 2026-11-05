@@ -17,6 +17,7 @@
 #include "strata/kernels/qsa.hpp"
 #include "strata/kernels/qsa_decode_attn.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
+#include "strata/kernels/qsa_prompt_attn_xmx.hpp"   // min_local_bytes: how much SLM the arm demands
 #include "strata/sycl_queue.hpp"   // intel_gpu_gen: which card is asking for the prompt-attn arm
 
 #include <algorithm>
@@ -458,16 +459,26 @@ int main() {
             // the XMX arm is OPT-IN (`STRATA_PROMPT_ATTN_XMX`, default 0).  So on an Alchemist with the arm unset a
             // refusal is the designed answer and the old kernel runs; a refusal AFTER asking for the arm is a real
             // failure.  Asking is checked rather than assumed, because otherwise the arm could rot unnoticed.
-            const char* arm = std::getenv("STRATA_PROMPT_ATTN_XMX");
-            const bool asked = arm != nullptr && std::atoi(arm) != 0;
-            const auto gen = strata::intel_gpu_gen(dpct::get_in_order_queue().get_device());
-            if (!asked && gen != strata::IntelGpuGen::Battlemage) {
-                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (no arm on this card: ESIMD is Battlemage-only, "
-                            "XMX is opt-in - the old kernel runs)\n");
+            // TWO reasons a refusal is the answer rather than a failure, and the test asks the DEVICE about both so it
+            // cannot rot silently: (a) the ESIMD arm is Battlemage-only, (b) both arms need more local memory than an
+            // Alchemist has - the smallest XMX chunk needs `qsa_prompt_attn_xmx_min_local_bytes()`, an A770 has 65536.
+            const auto dev = dpct::get_in_order_queue().get_device();
+            const auto gen = strata::intel_gpu_gen(dev);
+            const int64_t smem = (int64_t) dev.get_info<sycl::info::device::local_mem_size>();
+            const int64_t need = k::qsa_prompt_attn_xmx_min_local_bytes();
+            if (smem < need) {
+                std::printf("[5/5] qsa_prompt_attn mode 3: PASS (the smallest XMX chunk needs %lld of %lld bytes of "
+                            "local memory - the old kernel runs)\n",
+                            (long long) need, (long long) smem);
+            } else if (gen != strata::IntelGpuGen::Battlemage) {
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (the chunk fits in %lld bytes but the arm refused: "
+                            "ESIMD is Battlemage-only, XMX is opt-in - neither may refuse here)\n",
+                            (long long) smem);
+                g_fail = 1;
             } else {
-                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (asked: XMX=%s, gen=%s - refused the hybrid pools)\n",
-                            asked ? arm : "unset",
-                            gen == strata::IntelGpuGen::Battlemage ? "battlemage" : "alchemist");
+                std::printf("[5/5] qsa_prompt_attn mode 3: FAIL (Battlemage with %lld bytes of local memory, the arm "
+                            "asked for: refused the hybrid pools)\n",
+                            (long long) smem);
                 g_fail = 1;
             }
 #else
