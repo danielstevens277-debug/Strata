@@ -1180,9 +1180,6 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                     sycl::range(smem), cgh);
 
                 auto mrope_table_ct14 = mrope_table();
-                auto *slm = dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
-                                .get();
                 const sycl::nd_range<3> rng(sycl::range(1, 1, threads),
                                             sycl::range(1, 1, threads));
                 if (f64) {
@@ -1191,7 +1188,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                             indexer_key_append_kernel_f64(
                                 raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled,
                                 b.block_pos, (int)s.idx_dim, (int)s.idx_block, (int)s.n_rot, cos_tab,
-                                sin_tab, mrope_table_ct14, slm);
+                                sin_tab, mrope_table_ct14, dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                         });
                 } else {
                     cgh.parallel_for<dpct_kernel_name<class indexer_key_append_kernel_9e74e0_f32>>(
@@ -1199,7 +1196,7 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
                             indexer_key_append_kernel_f32(
                                 raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled,
                                 b.block_pos, (int)s.idx_dim, (int)s.idx_block, (int)s.n_rot, cos_tab,
-                                sin_tab, mrope_table_ct14, slm);
+                                sin_tab, mrope_table_ct14, dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                         });
                 }
             });

@@ -691,18 +691,17 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
         const size_t smem = f64 ? router_smem<double>(n_expert) : router_smem<float>(n_expert);
         strata::kprof::kp(&q, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& h) {
             sycl::local_accessor<uint8_t, 1> local(sycl::range<1>(smem), h);
-            auto* slm = local.get_multi_ptr<sycl::access::decorated::no>().get();
             const sycl::nd_range<3> rng(sycl::range<3>(1, 1, (size_t)n_tokens * threads),
                                         sycl::range<3>(1, 1, threads));
             if (f64) {
                 h.parallel_for<dpct_kernel_name<class router_top10_kernel_var_f64>>(rng,
                     [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                        router_top10_kernel<double>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                        router_top10_kernel<double>(logits, n_tokens, n_expert, k, ids, weights, local.get_multi_ptr<sycl::access::decorated::no>().get());
                     });
             } else {
                 h.parallel_for<dpct_kernel_name<class router_top10_kernel_var_f32>>(rng,
                     [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                        router_top10_kernel<float>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                        router_top10_kernel<float>(logits, n_tokens, n_expert, k, ids, weights, local.get_multi_ptr<sycl::access::decorated::no>().get());
                     });
             }
         });
@@ -791,8 +790,6 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
             ->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range(smem), cgh);
-                auto* slm = dpct_local_acc_ct1
-                                .get_multi_ptr<sycl::access::decorated::no>()
                                 .get();
                 const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned)n_tokens) *
                                                 sycl::range(1, 1, threads),
@@ -801,13 +798,13 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
                     cgh.parallel_for<dpct_kernel_name<class router_top10_kernel_3e0655_f64>>(
                         rng, exp_props,
                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                            router_top10_kernel<double>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                            router_top10_kernel<double>(logits, n_tokens, n_expert, k, ids, weights, dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                         });
                 } else {
                     cgh.parallel_for<dpct_kernel_name<class router_top10_kernel_3e0655_f32>>(
                         rng, exp_props,
                         [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
-                            router_top10_kernel<float>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                            router_top10_kernel<float>(logits, n_tokens, n_expert, k, ids, weights, dpct_local_acc_ct1.get_multi_ptr<sycl::access::decorated::no>().get());
                         });
                 }
             });
