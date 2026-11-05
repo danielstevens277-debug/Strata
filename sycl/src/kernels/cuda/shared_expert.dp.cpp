@@ -184,13 +184,6 @@ __dpct_inline__ void scalar_gate_kernel_f32(const uint16_t *x, const uint16_t *w
     scalar_gate_kernel<float>(x, w, o, n);
 }
 
-__dpct_inline__ void moe_combine_kernel_f64(const float *p, const float *w, const float *sh, float *y, int n, int k, int hs) {
-    moe_combine_kernel<double>(p, w, sh, y, n, k, hs);
-}
-__dpct_inline__ void moe_combine_kernel_f32(const float *p, const float *w, const float *sh, float *y, int n, int k, int hs) {
-    moe_combine_kernel<float>(p, w, sh, y, n, k, hs);
-}
-
 __dpct_inline__ void scale_kernel(float *__restrict__ out,
                                   const float *__restrict__ g, int n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -225,8 +218,9 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
     const int j = item_ct1.get_group(2) * item_ct1.get_local_range(2) +
                   item_ct1.get_local_id(2);
     if (j >= n_embd) return;
-    // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
-    // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
+    // Accumulate in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`) and, where the card
+    // can build it, in the reference's own type.  ACC is float on Alchemist because ANY double in a kernel is
+    // refused there - not just transcendentals: this kernel is a bare add and multiply, and it was still refused.
     ACC acc = (ACC) 0;
 #pragma unroll
     for (int e = 0; e < k; ++e) acc +=
@@ -234,6 +228,12 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
     if (has_shared) acc += (ACC) shared[j];
     y[j] = (float) acc;
+}
+__dpct_inline__ void moe_combine_kernel_f64(const float *p, const float *w, const float *sh, float *y, int n, int k, int hs) {
+    moe_combine_kernel<double>(p, w, sh, y, n, k, hs);
+}
+__dpct_inline__ void moe_combine_kernel_f32(const float *p, const float *w, const float *sh, float *y, int n, int k, int hs) {
+    moe_combine_kernel<float>(p, w, sh, y, n, k, hs);
 }
 
 }  // namespace

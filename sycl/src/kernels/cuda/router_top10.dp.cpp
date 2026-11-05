@@ -72,7 +72,6 @@ constexpr int RT_MAX_THREADS = 512;
 // The fork's parity-tested SYCL implementation of the HIP fast router below.
 // A tree sum brackets the serial reciprocal; ambiguous rounding falls back to
 // the original ascending sum. Selection and renormalisation stay in subgroup 0.
-template <bool FORCE_SERIAL>
 /// The relative width of the band the fast path uses to decide whether the tree sum's own ordering error can
 /// move the FLOAT reciprocal it is about to take (`f_lo == f_hi` below).  `double` can express the 2**-40 the
 /// CUDA original used - roughly 256 ulps, generous for a 512-term tree; `float` gets the same 256-ulp slack,

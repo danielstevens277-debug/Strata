@@ -775,6 +775,13 @@ __dpct_inline__ void qsa_gate_apply_kernel(const float *__restrict__ attn,
     out[i] = f16_from_f32((float) ((ACC) attn[i] * sig));
 }
 
+__dpct_inline__ void qsa_gate_apply_kernel_f64(const float *a, const float *q, int nh, int hd, uint16_t *o) {
+    qsa_gate_apply_kernel<double>(a, q, nh, hd, o);
+}
+__dpct_inline__ void qsa_gate_apply_kernel_f32(const float *a, const float *q, int nh, int hd, uint16_t *o) {
+    qsa_gate_apply_kernel<float>(a, q, nh, hd, o);
+}
+
 inline unsigned grid_for(long long n, int threads) {
     return (unsigned) ((n + threads - 1) / threads);
 }
@@ -896,6 +903,17 @@ void kv_append_step(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_tabl
     }
     check_launch("kv_append");
     if (stream == nullptr) check_sync("kv_append");
+}
+
+__dpct_inline__ void qsa_index_kernel_f64(const float *pooled, const float *q_idx, const float *bias,
+                                          int idx_n_head, int idx_dim, long long r, const int32_t *step,
+                                          float *cell_scores) {
+    qsa_index_kernel<double>(pooled, q_idx, bias, idx_n_head, idx_dim, r, step, cell_scores);
+}
+__dpct_inline__ void qsa_index_kernel_f32(const float *pooled, const float *q_idx, const float *bias,
+                                          int idx_n_head, int idx_dim, long long r, const int32_t *step,
+                                          float *cell_scores) {
+    qsa_index_kernel<float>(pooled, q_idx, bias, idx_n_head, idx_dim, r, step, cell_scores);
 }
 
 void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, const QsaShapes& s,
@@ -1128,19 +1146,6 @@ __dpct_inline__ void indexer_key_append_kernel_f32(const float *raw, const int32
     indexer_key_append_kernel<float>(raw, pos_dev, pos_base, w_k_norm, eps, tail, dead, pooled, block_pos,
                                      idx_dim, r, n_rot, cos_tab, sin_tab, mtab, slm);
 }
-__dpct_inline__ void qsa_gate_apply_f32_kernel_f64(const float *a, const float *q, int nh, int hd, float *o) {
-    qsa_gate_apply_f32_kernel<double>(a, q, nh, hd, o);
-}
-__dpct_inline__ void qsa_gate_apply_f32_kernel_f32(const float *a, const float *q, int nh, int hd, float *o) {
-    qsa_gate_apply_f32_kernel<float>(a, q, nh, hd, o);
-}
-__dpct_inline__ void qsa_gate_apply_kernel_f64(const float *a, const float *q, int nh, int hd, uint16_t *o) {
-    qsa_gate_apply_kernel<double>(a, q, nh, hd, o);
-}
-__dpct_inline__ void qsa_gate_apply_kernel_f32(const float *a, const float *q, int nh, int hd, uint16_t *o) {
-    qsa_gate_apply_kernel<float>(a, q, nh, hd, o);
-}
-
 void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
                         float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
                         const float* sin_tab, void* stream) {
@@ -1201,17 +1206,6 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     }
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
-}
-
-__dpct_inline__ void qsa_index_kernel_f64(const float *pooled, const float *q_idx, const float *bias,
-                                          int idx_n_head, int idx_dim, long long r, const int32_t *step,
-                                          float *cell_scores) {
-    qsa_index_kernel<double>(pooled, q_idx, bias, idx_n_head, idx_dim, r, step, cell_scores);
-}
-__dpct_inline__ void qsa_index_kernel_f32(const float *pooled, const float *q_idx, const float *bias,
-                                          int idx_n_head, int idx_dim, long long r, const int32_t *step,
-                                          float *cell_scores) {
-    qsa_index_kernel<float>(pooled, q_idx, bias, idx_n_head, idx_dim, r, step, cell_scores);
 }
 
 void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
@@ -1280,6 +1274,13 @@ __dpct_inline__ void qsa_gate_apply_f32_kernel(const float *__restrict__ attn,
     const ACC g = (ACC) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
     const ACC sig = (ACC) 1 / ((ACC) 1 + sycl::exp(-g));
     out[i] = (float) ((ACC) attn[i] * sig);
+}
+
+__dpct_inline__ void qsa_gate_apply_f32_kernel_f64(const float *a, const float *q, int nh, int hd, float *o) {
+    qsa_gate_apply_f32_kernel<double>(a, q, nh, hd, o);
+}
+__dpct_inline__ void qsa_gate_apply_f32_kernel_f32(const float *a, const float *q, int nh, int hd, float *o) {
+    qsa_gate_apply_f32_kernel<float>(a, q, nh, hd, o);
 }
 
 void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
