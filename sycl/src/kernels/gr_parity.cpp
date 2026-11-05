@@ -28,6 +28,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <exception>
 #include <algorithm>
 #include <cstdlib>
 #include <cstring>
@@ -728,7 +729,7 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 
 }  // namespace
 
-int main(int argc, char** argv) {
+static int gr_main(int argc, char** argv) {
     // UNBUFFERED.  A parity test that aborts inside a launch (a kernel the driver refuses, a capture it will not do)
     // otherwise loses every line it had already printed, because stdout is block-buffered the moment it is redirected -
     // which is how these tests run.  The failure then reads as "no output at all", which hides what it was doing.
@@ -1312,4 +1313,20 @@ int main(int argc, char** argv) {
     if (bad) return 1;
     if (selftest) std::printf("gr_parity OK\n");
     return 0;
+}
+
+/// A `sycl::exception` (a kernel the driver will not compile, a queue op it will not do) leaves `main` through
+/// `std::terminate`, and on Windows that is `abort()` - exit code 0xC0000409 and NOT ONE LINE of the message, which is
+/// why this test looked like it produced no output at all.  Naming the exception is the difference between a mystery and
+/// a failure.
+int main(int argc, char** argv) {
+    try {
+        return gr_main(argc, argv);
+    } catch (sycl::exception const& e) {
+        std::printf("\ngr_parity: SYCL exception: %s\n", e.what());
+        return 1;
+    } catch (std::exception const& e) {
+        std::printf("\ngr_parity: exception: %s\n", e.what());
+        return 1;
+    }
 }
