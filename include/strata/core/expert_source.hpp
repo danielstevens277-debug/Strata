@@ -999,7 +999,13 @@ private:
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
-    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
+    /// `in_place`: the read lands in `dst` itself (STRATA_DIRECT_IN_PLACE): `dst` is sector-aligned and the blob
+    /// starts at its file offset's 4 KiB remainder inside it, so the drive writes the blob's sectors straight in.
+    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; bool in_place = false; };
+    /// A claimed buffer's blob: where it is (an aligned stage buffer, the blob `stage_skip_` bytes in) and whether
+    /// an unbuffered read may land in it directly.
+    uint8_t* stage_ptr(size_t v) const { return stage_buf_[v].get() + stage_skip_[v]; }
+    Fill stage_fill(size_t v, int64_t layer, int64_t e) const { return {v, layer, e, stage_ptr(v), stage_in_place_[v] != 0}; }
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
     /// 149-cold: the claim half of `prefetch` (the blobs this call must fill; pending[i] = 1 for those, if given)
@@ -1074,6 +1080,7 @@ private:
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> pdirect_;              ///< open_prompt_direct: O_DIRECT fds for copy_blobs only
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    void* direct_mirror_ = nullptr;           ///< Windows, STRATA_EXPERTS_MIRROR: experts.bin's copy on another drive; each read is split between the two
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty() || io_pf_; }
@@ -1105,15 +1112,42 @@ private:
     // header has no cuda_runtime.h).
     struct StageBufFree {
         bool pinned = false;
+        bool aligned = false;   ///< STRATA_DIRECT_IN_PLACE: _aligned_malloc'd, for an overlapped read to land in
         void operator()(uint8_t* p) const noexcept;
     };
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
+    // Windows, an unbuffered experts.bin (STRATA_DIRECT_IN_PLACE=0: off): the buffers are sector-aligned and the
+    // drive reads the blob's sectors straight into one, the blob `stage_skip_` bytes in, with no copy out of a
+    // thread-local scratch buffer.
+    std::vector<uint32_t> stage_skip_;
+    std::vector<char> stage_in_place_;
     std::vector<int64_t> stage_key_;
     std::vector<uint64_t> stage_epoch_, stage_used_;
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
+    /// STRATA_COLD_KEPT_READERS=1 (with STRATA_COLD_OVERLAP=1): the reads on threads kept between layers, not
+    /// started per layer (that thread churn was the read overlap's whole cost on a 13-worker pool).  `run` starts
+    /// a batch of `n` units of work; `wait` returns when the last unit published.  The pool owns no work: the
+    /// caller's lambda must outlive `wait`.
+    struct KeptReaders {
+        ~KeptReaders();
+        void run(int n, std::function<void()> f);
+        void wait();
+        bool busy() const { return left.load(std::memory_order_acquire) > 0; }
+    private:
+        void loop(int idx);
+        std::vector<std::thread> th;
+        std::mutex m;
+        std::condition_variable cv;
+        std::function<void()> work;
+        std::atomic<uint64_t> gen{0};
+        std::atomic<int> left{0};
+        int want = 0;
+        bool stop = false, sleeping0 = false;
+    };
+    KeptReaders kept_readers_;
     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};

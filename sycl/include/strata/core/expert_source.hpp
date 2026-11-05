@@ -30,6 +30,7 @@
 #include <cstdint>
 #include <cstddef>
 #include <condition_variable>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -604,7 +605,13 @@ private:
     bool claim_stage(int64_t key, size_t& v, bool& fill);
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
-    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
+    /// `in_place`: the read lands in `dst` itself (STRATA_DIRECT_IN_PLACE): `dst` is sector-aligned and the blob
+    /// starts at its file offset's 4 KiB remainder inside it, so the drive writes the blob's sectors straight in.
+    struct Fill { size_t v; int64_t layer, e; uint8_t* dst; bool in_place = false; };
+    /// A claimed buffer's blob: where it is (an aligned stage buffer, the blob `stage_skip_` bytes in) and whether
+    /// an unbuffered read may land in it directly.
+    uint8_t* stage_ptr(size_t v) const { return stage_buf_[v].get() + stage_skip_[v]; }
+    Fill stage_fill(size_t v, int64_t layer, int64_t e) const { return {v, layer, e, stage_ptr(v), stage_in_place_[v] != 0}; }
     /// The claimed buffers' blobs: one overlapped batch when unbuffered, else the fetch threads' mapped copies.
     void fill_many(const std::vector<Fill>& todo);
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
@@ -613,6 +620,7 @@ private:
     bool open_direct(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
     std::vector<void*> direct_;               ///< #286: per file, an unbuffered handle (Windows) or O_DIRECT fd (Linux)
+    void* direct_mirror_ = nullptr;           ///< Windows, STRATA_EXPERTS_MIRROR: experts.bin's copy on another drive; each read is split between the two
     std::vector<int> role_file_;              ///< 3 x n_layers: index into maps_ / direct_
     /// blobs assembled in the stage buffers (`blob` hands those out): the GGUF in place, or any unbuffered source
     bool staged() const { return !role_ptr_.empty() || !direct_.empty(); }
@@ -636,13 +644,66 @@ private:
     // reused only once `kStageAge` layer changes have passed since its blob was last asked for, so a pointer holds
     // through the layer it was asked in and the next ones (the pool computes a layer's misses before the next).
     static constexpr uint64_t kStageAge = 3;
+    /// A stage buffer: pageable, or, with STRATA_DIRECT_IN_PLACE (Windows, an unbuffered experts.bin), 4 KiB
+    /// aligned and two sectors longer than the largest blob, so an overlapped read writes the blob's sectors
+    /// straight in (the sectors around it are part of the allocation and are simply not used).
+    struct StageBuf {
+        uint8_t* p = nullptr;
+        bool aligned = false;
+        StageBuf() = default;
+        explicit StageBuf(uint8_t* q, bool a = false) : p(q), aligned(a) {}
+        StageBuf(StageBuf&& o) noexcept : p(o.p), aligned(o.aligned) { o.p = nullptr; }
+        StageBuf& operator=(StageBuf&& o) noexcept {
+            if (this != &o) { reset(); p = o.p; aligned = o.aligned; o.p = nullptr; }
+            return *this;
+        }
+        StageBuf(const StageBuf&) = delete;
+        StageBuf& operator=(const StageBuf&) = delete;
+        ~StageBuf() { reset(); }
+        void reset() {
+            if (p == nullptr) return;
+#if defined(_WIN32)
+            if (aligned) _aligned_free(p); else delete[] p;
+#else
+            if (aligned) std::free(p); else delete[] p;
+#endif
+            p = nullptr;
+        }
+        uint8_t* get() const { return p; }
+    };
     std::mutex stage_mu_;
-    std::vector<std::unique_ptr<uint8_t[]>> stage_buf_;
+    std::vector<StageBuf> stage_buf_;
+    // Windows, an unbuffered experts.bin (STRATA_DIRECT_IN_PLACE=0: off): the buffers are sector-aligned and the
+    // drive reads the blob's sectors straight into one, the blob `stage_skip_` bytes in, with no copy out of a
+    // thread-local scratch buffer.
+    std::vector<uint32_t> stage_skip_;
+    std::vector<char> stage_in_place_;
     std::vector<int64_t> stage_key_;
     std::vector<uint64_t> stage_epoch_, stage_used_;
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
+    /// STRATA_COLD_KEPT_READERS=1: the fill's reader threads are created once and kept between batches, instead
+    /// of a thread per layer per batch (that thread churn was the read overlap's whole cost on a 13-worker pool).
+    /// `run` starts a batch of `n` units of work; `wait` returns when the last unit published.  The pool owns no
+    /// work: the caller's lambda must outlive `wait`.
+    struct KeptReaders {
+        ~KeptReaders();
+        void run(int n, std::function<void()> f);
+        void wait();
+        bool busy() const { return left.load(std::memory_order_acquire) > 0; }
+    private:
+        void loop(int idx);
+        std::vector<std::thread> th;
+        std::mutex m;
+        std::condition_variable cv;
+        std::function<void()> work;
+        std::atomic<uint64_t> gen{0};
+        std::atomic<int> left{0};
+        int want = 0;
+        bool stop = false, sleeping0 = false;
+    };
+    KeptReaders kept_readers_;
     std::atomic<uint64_t> file_blob_bytes_{0}, file_us_{0};
     std::unique_ptr<std::atomic<uint32_t>[]> warm_stamp_;   ///< per (layer, expert): epoch_ + 1 when warmed
     std::atomic<int64_t> warm_hits_{0}, warm_count_{0};
