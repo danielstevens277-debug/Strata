@@ -173,6 +173,7 @@ void select_activation_mode(int mode) {
 // At R=1 and eps=0, xn=gamma exactly; any rounding in xn or lo comes from the selected activation contract.
 int scalar_activation_contract() {
     using namespace strata::kernels;
+    std::printf("  [scalar] alloc\n");
     const GrShapes sh{2, 1, 2};
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t* d_weights = nullptr;
@@ -196,6 +197,7 @@ int scalar_activation_contract() {
               d_scratch = (void *)sycl::malloc_device(
                   gr_workspace_bytes(sh), dpct::get_in_order_queue())),
           "scalar scratch");
+    std::printf("  [scalar] workspace: %zu bytes\n", (size_t) gr_workspace_bytes(sh));
     GrWorkspace ws;
     gr_workspace_init(sh, d_scratch, ws);
     const float ones[] = {1.0f, 1.0f};
@@ -247,7 +249,9 @@ int scalar_activation_contract() {
             select_activation_mode(mode);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
+            std::printf("  [scalar] launching gamma %.4f mode %d\n", gamma, mode);
             check(DPCT_CHECK_ERROR(stream->wait()), "scalar warmup");
+            std::printf("  [scalar] warmup done\n");            check(DPCT_CHECK_ERROR(stream->wait()), "scalar warmup");
             if (!graphs_enabled()) {
                 gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, stream);
                 check(DPCT_CHECK_ERROR(stream->wait()), "scalar direct sync");
