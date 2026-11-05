@@ -434,8 +434,13 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
+            // NOT an fp64 kernel: use_fp32 selects the ACTIVATION CONTRACT (bf16 vs f32 rounding), not the
+            // accumulation type, and nothing in this module is a double any more (see the comment on
+            // gr_norm_kernel).  The has_capability_or_fail(aspect::fp64) dpct emitted here was therefore
+            // rejecting Alchemist cards - an A770 has no FP64 units, and the runtime answers with
+            // double-is-not-supported-in-this-device - for a capability these kernels do not use.  Dropped.
+            // A genuinely fp64-weighted kernel must ask strata::fp64_kernels_ok and pick a float
+            // instantiation instead (the pattern in shared_expert.dp.cpp).
 
             strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_norm_kernel_588e81,
                                               dpct_kernel_scalar<true>>>(
@@ -486,8 +491,7 @@ void gr_read(const float *R, const float *w_norm, const uint16_t *w_down,
         {
             auto exp_props = sycl::ext::oneapi::experimental::properties{
                 sycl::ext::oneapi::experimental::use_root_sync};
-            dpct::has_capability_or_fail(st->get_device(),
-                                         {sycl::aspect::fp64});
+            // Same as above: no double in this module.
 
             strata::kprof::kp(st, __FILE__, __func__, __LINE__)->template parallel_for<dpct_kernel_name<class gr_norm_kernel_70bea5,
                                               dpct_kernel_scalar<false>>>(
