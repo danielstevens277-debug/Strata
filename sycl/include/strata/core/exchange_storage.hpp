@@ -27,27 +27,44 @@ public:
                     uint8_t* exchange_host, const uint8_t* exchange_device,
                     size_t count, size_t blob_bytes, std::string& error) {
         error.clear();
-        if (active()) { error = "exchange storage already initialized"; return false; }
-        if (!resident_host || !resident_device || !exchange_host || !exchange_device ||
-            !blob_bytes || !count || !resident_bytes || resident_bytes % blob_bytes ||
-            count > std::numeric_limits<size_t>::max() / blob_bytes) {
+        if (!resident_host || !resident_device || !resident_bytes || !blob_bytes || resident_bytes % blob_bytes) {
             error = "invalid uniform mapped exchange geometry"; return false;
         }
         const size_t resident_slots = (size_t)(resident_bytes / blob_bytes);
+        std::vector<View> resident(resident_slots);
+        for (size_t slot = 0; slot < resident_slots; ++slot)
+            resident[slot] = {resident_host + slot * blob_bytes, resident_device + slot * blob_bytes};
+        return initialize_slots(offsets, resident, exchange_host, exchange_device, count, blob_bytes, error);
+    }
+
+    /// The same, for a resident arena that is not one contiguous block: a chunked page-lock complement (2 GiB chunks, so
+    /// the Alchemist allocation limit is not hit) puts each blob inside whichever chunk holds it, and there is no base
+    /// pointer to add slot*blob_bytes to.  `resident[slot]` is that blob's host and device address.
+    bool initialize_slots(const std::vector<uint64_t>& offsets, const std::vector<View>& resident,
+                          uint8_t* exchange_host, const uint8_t* exchange_device,
+                          size_t count, size_t blob_bytes, std::string& error) {
+        error.clear();
+        if (active()) { error = "exchange storage already initialized"; return false; }
+        if (resident.empty() || !exchange_host || !exchange_device ||
+            !blob_bytes || !count || count > std::numeric_limits<size_t>::max() / blob_bytes) {
+            error = "invalid uniform mapped exchange geometry"; return false;
+        }
+        const size_t resident_slots = resident.size();
         if (resident_slots > std::numeric_limits<size_t>::max() - count) {
             error = "exchange slot count overflow"; return false;
         }
+        for (const View& slot : resident)
+            if (slot.host == nullptr || slot.device == nullptr) { error = "resident slot is not mapped"; return false; }
         auto experts = std::make_unique<std::atomic<size_t>[]>(offsets.size());
         std::vector<size_t> spares(count);
         std::vector<View> buffers(resident_slots + count);
-        for (size_t slot = 0; slot < resident_slots; ++slot)
-            buffers[slot] = {resident_host + slot * blob_bytes, resident_device + slot * blob_bytes};
+        for (size_t slot = 0; slot < resident_slots; ++slot) buffers[slot] = resident[slot];
         std::vector<bool> used(resident_slots, false);
         for (size_t i = 0; i < offsets.size(); ++i) {
             const uint64_t at = offsets[i];
             experts[i].store(kAbsent, std::memory_order_relaxed);
             if (at == ~uint64_t{0}) continue;
-            if (at >= resident_bytes || at % blob_bytes || used[(size_t)(at / blob_bytes)]) {
+            if (at >= (uint64_t) resident_slots * blob_bytes || at % blob_bytes || used[(size_t)(at / blob_bytes)]) {
                 error = "invalid or duplicate resident slot"; return false;
             }
             used[(size_t)(at / blob_bytes)] = true;

@@ -414,6 +414,17 @@ bool file_tier_unbuffered(const std::vector<std::string>& paths, uint64_t arena_
 #endif
 }
 
+/// The page-lock chunk size (STRATA_PIN_CHUNK_MIB, 2 GiB by default).  A single sycl::malloc_host above ~3 GiB is
+/// refused on Alchemist (docs/INTEL.md, A750), so a bigger complement is locked in chunks cut at expert boundaries.
+uint64_t pin_chunk_bytes() {
+    static const uint64_t bytes = [] {
+        const char* env = std::getenv("STRATA_PIN_CHUNK_MIB");
+        const double mib = env != nullptr ? std::atof(env) : 0.0;
+        return (uint64_t) ((mib > 0 ? mib : 2048.0) * 1048576.0);
+    }();
+    return bytes;
+}
+
 }  // namespace
 
 // ================================ THE FILE-BACKED SOURCE ================================
@@ -2091,11 +2102,21 @@ bool FileExpertSource::pin_cache_complement(
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         log_complement_memory("before complement allocation", bytes);
         std::fflush(stderr);
-        if (pin && bytes > (2ull << 30) && std::getenv("STRATA_PIN_SINGLE_BLOCK") == nullptr) {
-            // Plan chunks at expert boundaries.  A single sycl::malloc_host past ~3 GiB is refused on Alchemist
-            // (docs/INTEL.md, A750), which is why the 32 GiB complement used to fall back to pageable memory with no
-            // device alias.  GgufExpertSource::mirror uses the same 2 GiB chunking for the streamed path.
-            constexpr uint64_t kChunk = 2ull << 30;
+        // Chunking is the default above one chunk: a single sycl::malloc_host past ~3 GiB is refused on Alchemist
+        // (docs/INTEL.md, A750) and the refusal arrives as a null here, not as an exception, so a 36 GiB complement
+        // asked for in one block ends up pageable with no device alias.  GgufExpertSource::mirror plans the streamed
+        // path the same way.  STRATA_PIN_CHUNK_MIB sets the chunk size; STRATA_PIN_SINGLE_BLOCK keeps the old
+        // one-allocation behaviour for a driver that prefers it, and says what it costs when it cannot fit.
+        const uint64_t kChunk = pin_chunk_bytes();
+        const bool single_block = std::getenv("STRATA_PIN_SINGLE_BLOCK") != nullptr;
+        if (pin && single_block && bytes > kChunk)
+            std::fprintf(stderr,
+                         "FileExpertSource: STRATA_PIN_SINGLE_BLOCK is set: the %.2f GiB complement is asked for in one "
+                         "page-locked allocation, which this driver refuses above ~3 GiB (it falls back to pageable "
+                         "memory).  Unset it for %llu x %.2f GiB chunks.\n",
+                         (double) bytes / 1073741824.0, (unsigned long long) ((bytes + kChunk - 1) / kChunk),
+                         (double) kChunk / 1073741824.0);
+        if (pin && !single_block && bytes > kChunk) {
             std::vector<std::pair<uint64_t, uint64_t>> spans;   // (start, end) of every expert in the complement
             spans.reserve(offsets.size());
             for (size_t i = 0; i < offsets.size(); ++i) {
@@ -2107,13 +2128,27 @@ bool FileExpertSource::pin_cache_complement(
             std::vector<uint64_t> bounds;
             bounds.push_back(0);
             uint64_t start = 0;
+            uint64_t biggest = 0;
+            int oversized = 0;
             for (const auto& sp : spans) {
+                if (sp.second <= start + kChunk) continue;
+                // A blob cannot straddle two chunks (host_at/device_at hand out one pointer per blob), so a chunk is
+                // closed at the first blob that does not fit and that blob opens the next one.  Cutting only when
+                // sp.first > start dropped the boundary whenever a blob started exactly at the chunk start - an
+                // expert at offset 0, or the blob that had just opened this chunk - and the chunk then grew past
+                // its budget by up to that blob.
+                if (sp.first > start) { bounds.push_back(sp.first); start = sp.first; }
                 if (sp.second > start + kChunk) {
-                    if (sp.first > start) bounds.push_back(sp.first);
-                    start = sp.first;
+                    ++oversized;   // a blob bigger than a chunk cannot be split: it gets a chunk of its own
+                    biggest = std::max(biggest, sp.second - sp.first);
                 }
             }
             if (bytes > start) bounds.push_back(bytes);
+            if (oversized > 0)
+                std::fprintf(stderr,
+                             "FileExpertSource: %d expert blob(s) are larger than the %.2f GiB page-lock chunk "
+                             "(largest %.2f GiB); each gets a chunk of its own, so a refusal below is that size\n",
+                             oversized, (double) kChunk / 1073741824.0, (double) biggest / 1073741824.0);
             std::vector<uint64_t> ub;
             for (uint64_t b : bounds)
                 if (ub.empty() || b > ub.back()) ub.push_back(b);
@@ -2152,54 +2187,26 @@ bool FileExpertSource::pin_cache_complement(
             }
         }
         if (pin && !chunked) {
-            const dpct::err0 allocated = DPCT_CHECK_ERROR(
-                arena = (void *)sycl::malloc_host((size_t)bytes,
-                                                  dpct::get_in_order_queue()));
-            if (allocated == 0) {
-                void* alias = nullptr;
-                const dpct::err0 aliased =
-                    DPCT_CHECK_ERROR(alias = (void *)arena);
-                if (aliased == 0 && alias != nullptr) {
-                    device = (const uint8_t*) alias;
-                    pinned_ok = true;
-                    note = "page-locked and mapped";
-                } else {
-                    /*
-                    DPCT1009: SYCL reports errors using exceptions and does
-                    not use error codes. Please replace the
-                    "get_error_string_dummy(...)" with a real error-handling
-                    function.
-                    */
-                    note = std::string("no device alias (") +
-                           dpct::get_error_string_dummy(aliased) + ")";
-                    /*
-                    DPCT1010: SYCL uses exceptions to report errors and
-                    does not use the error codes. The cudaGetLastError function
-                    call was replaced with 0. You need to rewrite this code.
-                    */
-                    (void)0;
-                    (void)DPCT_CHECK_ERROR(
-                        sycl::free(arena, dpct::get_in_order_queue()));
-                    arena = nullptr;
-                }
+            // One page-locked allocation.  Under Level Zero malloc_host either throws or returns null when the driver
+            // refuses it, and null is the case seen here (36 GiB on the A770 came back null, no exception).  Calling
+            // that success and then reading arena as a "device alias" reported the refusal as a missing CUDA alias -
+            // a concept USM does not have: host memory from malloc_host IS device-addressable, so arena is the device
+            // pointer.  The message now names the refusal, and the size is on the line above.
+            arena = nullptr;
+            try {
+                arena = (void*) sycl::malloc_host((size_t) bytes, dpct::get_in_order_queue());
+            } catch (const sycl::exception& ex) {
+                note = std::string("page-locking refused (") + ex.what() + ")";
+            }
+            if (arena != nullptr) {
+                device = (const uint8_t*) arena;
+                pinned_ok = true;
+                note = note.empty() ? std::string("page-locked and mapped")
+                                    : note + "; a single page-locked block succeeded after all";
+            } else if (note.empty()) {
+                note = "page-locking refused (malloc_host returned null)";
             } else {
-                // Refused (the driver's page-locked limit): the same bytes in ordinary memory, locked in the working
-                // set instead, as the arena does - resident either way, only copied by the CPU instead of by DMA.
-                /*
-                DPCT1009: SYCL reports errors using exceptions and does not
-                use error codes. Please replace the
-                "get_error_string_dummy(...)" with a real error-handling
-                function.
-                */
-                note = std::string("page-locking refused (") +
-                       dpct::get_error_string_dummy(allocated) + ")";
-                /*
-                DPCT1010: SYCL uses exceptions to report errors and does
-                not use the error codes. The cudaGetLastError function call was
-                replaced with 0. You need to rewrite this code.
-                */
-                (void)0;
-                arena = nullptr;
+                note += "; a single page-locked block was refused too (null)";
             }
         }
         if (!chunked && arena == nullptr) {
@@ -2538,8 +2545,26 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
     const bool requested = rotate_env && std::strcmp(rotate_env, "1") == 0;
     const bool uniform = std::all_of(layer_blob_bytes_.begin(), layer_blob_bytes_.end(),
                                     [blob](uint64_t b) { return b == blob; });
-    const bool eligible = requested && uniform && complement_pinned_ && !complement_partial_ &&
-                          !complement_chunked_ && complement_host_ && complement_device_ && complement_bytes_ > 0;
+    // The rotation addresses the resident arena one slot at a time, so a chunked complement (each blob inside whichever
+    // page-lock chunk holds it, no base pointer) gives it the per-slot addresses instead.  The old test required
+    // !complement_chunked_, which made STRATA_EXCHANGE_ROTATE unavailable in the one configuration chunking produces.
+    std::vector<core::detail::ExchangeStorage::View> resident_slots;
+    if (requested && uniform && complement_pinned_ && !complement_partial_ && complement_bytes_ > 0) {
+        const size_t slots = (size_t) (complement_bytes_ / blob);
+        resident_slots.assign(slots, core::detail::ExchangeStorage::View{});
+        bool mapped = slots > 0;
+        for (size_t i = 0; i < complement_offsets_.size() && mapped; ++i) {
+            const uint64_t at = complement_offsets_[i];
+            if (at == kNoComplement) continue;
+            if (at % blob != 0 || at / blob >= slots) { mapped = false; break; }
+            core::detail::ExchangeStorage::View& v = resident_slots[(size_t) (at / blob)];
+            v.host = const_cast<uint8_t*>(complement_host_ptr_[i]);   // the pointer table stores it const
+            v.device = complement_device_ptr_[i];
+            if (v.host == nullptr || v.device == nullptr) mapped = false;
+        }
+        if (!mapped) resident_slots.clear();
+    }
+    const bool eligible = requested && uniform && !resident_slots.empty();
     const size_t total = (size_t) n * (size_t) blob;
     void* p = nullptr;
     /*
@@ -2576,8 +2601,13 @@ bool FileExpertSource::reserve_exchanges(int64_t n, std::string& err) {
         if (eligible && xstage_pinned_ &&
             DPCT_CHECK_ERROR(device = (void *)p) == 0 && device) {
             try {
-                if (exchange_storage_.initialize(complement_offsets_, (uint8_t*)complement_host_, complement_device_,
-                        complement_bytes_, xstage_, (const uint8_t*)device, (size_t)n, (size_t)blob, reason)) {
+                const bool rotated = complement_chunked_
+                    ? exchange_storage_.initialize_slots(complement_offsets_, resident_slots, xstage_,
+                                                         (const uint8_t*)device, (size_t)n, (size_t)blob, reason)
+                    : exchange_storage_.initialize(complement_offsets_, (uint8_t*)complement_host_,
+                                                   complement_device_, complement_bytes_, xstage_,
+                                                   (const uint8_t*)device, (size_t)n, (size_t)blob, reason);
+                if (rotated) {
                     std::fprintf(stderr, "FileExpertSource: exchange buffer rotation enabled: %lld buffers, %llu bytes each; no host commit memcpy\n",
                                  (long long)n, (unsigned long long)blob);
                 }

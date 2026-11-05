@@ -2172,8 +2172,12 @@ int main(int argc, char **argv) try {
             return 2;
         }
         if (!d.has(sycl::aspect::ext_intel_free_memory)) {
-            std::fprintf(stderr, "strata generate: free VRAM query is unavailable (ext_intel_free_memory); check the Intel GPU driver and oneAPI runtime\n");
-            return 2;
+            // Advisory, as ext_oneapi_graph below: setup_intel.py used to be the stricter of the two, and the engine's
+            // own cache sizing already copes with a driver that cannot answer (expert_cache.cpp: 0 free with a known
+            // total), so refusing to start over it cost a run that would have worked.
+            std::fprintf(stderr, "strata generate: note: free VRAM is unknown (ext_intel_free_memory is not reported); "
+                                 "the expert cache falls back to the card's total.  Check the Intel GPU driver and "
+                                 "oneAPI runtime\n");
         }
         if (!d.has(sycl::aspect::ext_oneapi_graph)) {
             std::fprintf(stderr, "strata generate: note: ext_oneapi_graph aspect not reported, proceeding\n");
