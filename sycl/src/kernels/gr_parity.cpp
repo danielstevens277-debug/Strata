@@ -787,11 +787,14 @@ static int gr_main(int argc, char** argv) {
     for (size_t i = 0; i < w_inject.size(); ++i) q_inject[i] = bf16_bits(w_inject[i]);
 
     // ---- device side
+    std::printf("  [main] fixtures built, first allocation\n");
+    std::fflush(stdout);
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t *d_down = nullptr, *d_up = nullptr, *d_inj = nullptr;
     check(DPCT_CHECK_ERROR(d_R = sycl::malloc_device<float>(
                                R.size(), dpct::get_in_order_queue())),
           "m R");
+    std::printf("  [main] R allocated\n");
     check(DPCT_CHECK_ERROR(d_norm = sycl::malloc_device<float>(
                                w_norm.size(), dpct::get_in_order_queue())),
           "m norm");
