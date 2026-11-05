@@ -868,7 +868,14 @@ static int gr_main(int argc, char** argv) {
           "m ws");
     strata::kernels::GrWorkspace ws;
     strata::kernels::gr_workspace_init(sh, d_ws_raw, ws);
-    strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
+    std::printf("  [main] inputs uploaded, first gr_read\n"); std::fflush(stdout);
+    try {
+        strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
+        std::printf("  [main] gr_read returned\n");
+    } catch (const std::exception& e) {
+        std::printf("  [main] gr_read threw: %s\n", e.what()); std::fflush(stdout); return 1;
+    }
+
     std::vector<float> got_mixed((size_t) n_embd), got_inject((size_t) hc);
     check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
                                .memcpy(got_mixed.data(), d_mixed,
