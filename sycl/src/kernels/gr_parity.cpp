@@ -36,6 +36,11 @@
 #include <vector>
 
 namespace {
+/// STRATA_GR_NOGRAPH=1 skips the capture/replay halves (the launches themselves still run, in order, and the
+/// comparisons against the reference stay).  It exists because a driver that aborts inside `begin_recording` takes the
+/// whole test with it and reports nothing at all: with this the arithmetic can still be checked on such a driver, and
+/// what is lost is named in the output instead of implied.
+bool graphs_enabled() { return std::getenv("STRATA_GR_NOGRAPH") == nullptr; }
 
 void check(dpct::err0 e, const char *what) {
 }
@@ -242,7 +247,7 @@ int scalar_activation_contract() {
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
             check(DPCT_CHECK_ERROR(stream->wait()), "scalar warmup");
-            if (!graphs) {
+            if (!graphs_enabled()) {
                 gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, stream);
                 check(DPCT_CHECK_ERROR(stream->wait()), "scalar direct sync");
                 check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
@@ -729,11 +734,7 @@ int main(int argc, char** argv) {
     // which is how these tests run.  The failure then reads as "no output at all", which hides what it was doing.
     std::setvbuf(stdout, nullptr, _IONBF, 0);
     std::printf("=== Running gr_parity test ===\n");
-    // STRATA_GR_NOGRAPH=1 skips the capture/replay halves (the launches themselves still run, in order, and every
-    // comparison against the reference stays).  It exists because a driver that aborts inside begin_recording takes
-    // the whole test with it and reports nothing: with this the arithmetic can still be checked on such a driver, and
-    // what is lost is named in the output instead of implied.
-    const bool graphs = std::getenv("STRATA_GR_NOGRAPH") == nullptr;
+
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
