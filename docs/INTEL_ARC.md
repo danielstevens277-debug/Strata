@@ -323,8 +323,16 @@ against 11,264 - every pair inside the run-to-run spread, which is wider than th
 to the models measured here. One workflow note: a running server holds
 `build-sycl-win\strata.exe`, so the link fails with `LNK1104` until it is stopped.
 
-What has **not** been run on Windows: pictures, the Arc A-series (Windows uses Level Zero for every Arc, `i915` is a
-Linux driver), two cards, and the Docker path. WSL2 with an Arc has been used by one tester (the B580 row in "Tested cards" above), but
+What has **not** been run on Windows: the SYCL (GPU) picture reader - the CPU reader runs there, `build_windows.bat` builds
+it as `strata-vision.exe` and setup points a model at it, so pictures are on by default like on Linux - two cards, and the
+Docker path.
+
+The Arc A-series has been run on Windows since: an A770 16 GB, Windows 11, Level Zero, engine 0.1.56, a 48-layer IQ3_S
+model at `--max-context 262144`.  The 36 GiB resident complement is page-locked in 19 x 2 GiB `malloc_host` chunks, ready
+in 29 s.  Before that it was one `malloc_host` of the whole complement, which this driver refuses (it returns null), so the
+complement fell back to pageable memory and `--pcie-frac` had no device address to copy to.  Windows reaches every Arc
+through Level Zero (`i915` is a Linux driver), and some Arc drivers here do not report `ext_intel_free_memory`: the engine
+says so and carries on, sizing the expert cache from the card's total. WSL2 with an Arc has been used by one tester (the B580 row in "Tested cards" above), but
 setup cannot detect the card there, because it reads `/sys/class/drm`, which WSL2 does not have.
 
 ## Reporting a problem

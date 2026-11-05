@@ -121,8 +121,10 @@ def intel_gpus():
                     S.fail(f"native Windows inference requires Level Zero, not {card.get('driver', 'unknown')}",
                            "set ONEAPI_DEVICE_SELECTOR=level_zero:gpu and check the Intel GPU driver and oneAPI runtime")
                 if card.get("free_memory_supported") is not True:
-                    S.fail("native Intel GPU free VRAM query is unavailable (ext_intel_free_memory)",
-                           "rebuild the native engine and check the Intel GPU driver and oneAPI runtime")
+                    # advisory, as in the engine (generate.cpp prints the same note and carries on): a driver that cannot
+                    # report free VRAM is a cache-sizing problem, not a reason to refuse the run
+                    S.warn("the driver reports no free VRAM (ext_intel_free_memory): the expert cache sizes itself from "
+                           "the card's total instead (docs/INTEL_ARC.md, Windows)")
                 if card.get("command_graph_supported") is not True and card.get("devid") not in ALCHEMIST_IDS:
                     S.fail("native Intel GPU command graphs are unavailable (ext_oneapi_graph)",
                            "rebuild the native engine and check the Intel GPU driver and oneAPI runtime")
@@ -557,10 +559,18 @@ def install(argv) -> None:
     S.amd_gpus = lambda *a, **k: intel
     S.amd_problem = lambda g: None
     if S.WIN:
-        # The native Windows engine is built by build_windows.bat, which builds the engine only: the picture readers
-        # (setup's build_vision_cpu and the SYCL GPU reader) have no Windows build path yet, so pictures stay off
-        # there rather than writing a config that points at a reader nobody built (docs/INTEL_ARC.md, "Windows").
-        S.hip_vision = lambda asked, vram_gb=0.0: "none"
+        # build_windows.bat builds the CPU picture reader (tools/vision, no CUDA) as strata-vision.exe beside strata.exe
+        # on every run, so an engine folder that has one takes pictures like the Linux path does: setup's hip_reader()
+        # then finds it (vision_reader.find looks for the .exe on Windows).  A build folder from before that, or one
+        # the reader was left out of, says so rather than writing a config that starts a reader nobody built.
+        def windows_vision(asked, vram_gb=0.0):
+            exe, _ = sycl_engine()
+            if exe is None or not (exe.parent / "strata-vision.exe").is_file():
+                if (asked or "").lower() not in ("no", "none", "off"):
+                    S.say("  pictures stay off: the build folder has no strata-vision.exe (build_windows.bat builds it)")
+                return "none"
+            return intel_vision(asked, vram_gb)
+        S.hip_vision = windows_vision
     else:
         S.hip_vision = intel_vision                     # pictures on by default, read on the CPU (setup's hip_reader settles it)
 

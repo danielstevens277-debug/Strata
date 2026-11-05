@@ -52,6 +52,7 @@ Measured progress, not estimates:
 | CPU misses, larger cache and tuned prompt reservation | about 9-11 tok/s | Same context capacity |
 | Fast router plus borrowing and paired mapped transfers | 13.5, 11.9, 12.3 tok/s | 546 input tokens, 128 generated, no prefix reuse |
 | Same final configuration, short warm prompt | 11.4 tok/s | 73 input tokens, 128 generated |
+| A770 16 GB on **Windows** (Level Zero, engine 0.1.56) | not recorded | The doc's kernel findings are the `xe` driver's; on Windows the same card page-locks its resident complement in 2 GiB chunks (36 GiB in 19 chunks, ready in 29 s). Before the chunking default, one 36 GiB `malloc_host` was refused and the complement was pageable, which is why this doc's `--pcie-frac` result was "inert" |
 
 The final configuration had 4,717 expert slots, approximately 8.98 GiB in VRAM
 and 15.08 GiB of resident RAM experts. Existing runs did not test a full 128K
@@ -210,7 +211,11 @@ less), so any split must be re-measured here, not copied.
    on pageable host memory and an explicit nonzero value warns it "hung an Arc
    Pro B70 (device lost)". Run it guarded: watch for device loss and revert
    immediately. If the resident complement is not actually pinnable, record this
-   as unsafe on `xe` and stop.
+   as unsafe on `xe` and stop. (It was not, at the time: one `malloc_host` of the
+   whole complement is refused on Alchemist, the complement fell back to pageable
+   memory and `--pcie-frac` counted nothing. It is chunked and pinned now - 36 GiB in
+   19 blocks under Windows - so the split has a device side to copy to; the link
+   measurement above still decides whether it is worth running.)
 2. **Controlled ms/round measurement.** Infernix ranks changes by **ms per
    round** on a **controlled token stream** (identical round/acceptance counts),
    arms **interleaved in one window**, std dev <0.02 ms, and warns that one-side
@@ -229,7 +234,11 @@ VRAM ledger and Windows budget handling, and its 6-CPU-worker finding (we are at
 
 ### WP6 results so far
 
-- **Item 1, `--pcie-frac` — inert on `xe` resident-experts mode (resolved).**
+- **Item 1, `--pcie-frac` — counted nothing in this run (cause found later).**
+  The run is valid, the conclusion is dated: the resident complement was one
+  `malloc_host` that the driver refused, so it was pageable and had no device
+  address to copy to.  Chunked into 2 GiB blocks (and that is now the default), the
+  complement pins: an A770 under Windows page-locked 36 GiB in 19 chunks in 29 s.
   `--pcie-frac 0.05` was accepted (with the pageable-memory warning) and did not
   fault or lose the device, but the decode timing reported **`PCIe 0.00`**
   experts: the counter never moved, so no GPU-side PCIe expert fetch happened.
@@ -238,8 +247,8 @@ VRAM ledger and Windows budget handling, and its 6-CPU-worker finding (we are at
   experts resident). `--pcie-frac` does not wire a PCIe read path in this mode;
   the only PCIe expert path is the pinned mirror (`--stream-experts`), which is
   ~5x slower here because the A770 link is PCIe 3.0 x4 (~1.8 GB/s). The
-  Infernix-style hybrid CPU+PCIe split is therefore **not reachable / not useful
-  on this card**. Keep `--pcie-frac 0`.
+  Infernix-style hybrid CPU+PCIe split is therefore **not useful on this card** with
+  a 1.8 GB/s link. Keep `--pcie-frac 0`.
 - **Item 3, adaptive draft length** — resolved: keep the default 0.5. Steady
   decode in one window cluster (546-token prompt, 256 generated):
   `--spec-min-p 0.0` = 10.4 / 10.5 / 10.4 tok/s (draft acceptance ~52%);
@@ -406,12 +415,18 @@ Primary matched configuration:
 
 ```text
 --max-context 131072 --kv int8 --kv-resident 32768
---expert-cache auto --resident-experts
---prefill 1024 --prefill-borrow --vram-reserve-mib 300
+--expert-cache auto --stream-experts --resident-budget-gib 36 --expert-profile <path>
+--prefill 1024 --vram-reserve-mib 300
 --pool-workers 7 --pool-affinity auto --adapt-swaps 8
 --spec 4 --spec-min-p 0.5 --no-spec-split --mtp <existing MTP path>
 --prompt-cache 0
 ```
+
+`--resident-experts` (the `xe`-era resident mode: `--mmap-experts
+--resident-cpu-experts`) is still accepted for A/B, but the resident complement is now
+chosen by `--resident-budget-gib` and read through `--stream-experts`; on Windows the
+complement is page-locked in 2 GiB chunks. `--prefill-borrow` is the default since plan
+v0.3 P5 (`--no-prefill-borrow` turns it off), so listing it changes nothing.
 
 Environment: retain the existing FP64-emulation variables and
 `ONEAPI_DEVICE_SELECTOR=level_zero:1`; set `STRATA_VERIFY_NO_HOST=0` in the
@@ -543,7 +558,8 @@ the effective token/window count, not the BF16 projection geometry tested here.
 
 ### End-to-end confirmation (this revision, unprofiled)
 
-Config: `--resident-experts --prefill-borrow --prefill 1024 --vram-reserve-mib
+Config: `--resident-experts` (today: `--stream-experts --resident-budget-gib 36`;
+prefill borrowing and `--prefill 1024` are the defaults), `--vram-reserve-mib
 300 --pool-workers 7 --adapt-swaps 8 --spec 4 --no-spec-split`, 131072 context,
 INT8 KV, 32K resident, `--prompt-cache 0`, `STRATA_VERIFY_NO_HOST=0`. 8.98 GiB
 VRAM expert cache, 15.08 GiB resident RAM.
