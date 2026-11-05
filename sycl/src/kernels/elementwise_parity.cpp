@@ -18,6 +18,7 @@
 #include "strata/kernels/dequant_bf16.hpp"
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/f16_bits.hpp"
+#include "strata/sycl_queue.hpp"   // fp64_kernels_ok: the silu accumulator depends on the card
 
 #include <cmath>
 #include <cstdio>
@@ -221,8 +222,13 @@ int main(int argc, char** argv) {
                                    .wait()),
               "csg");
         const double rel = rel_l1(want, got);
-        std::printf("\n  %-44s rel %.3e\n", "silu (double) vs the reference", rel);
-        if (!(rel <= 1e-7)) { std::printf("    *** over 1e-7 ***\n"); ++bad; }
+        // The kernel transcribes the reference in double, but on an Alchemist (dg2) it runs the fp32 instantiation:
+        // the arch id decides, so the budget follows the same switch instead of pretending the fp64 kernel ran.
+        const bool f64 = strata::fp64_kernels_ok(dpct::get_in_order_queue().get_device());
+        const double silu_tol = f64 ? 1e-7 : 1e-6;
+        std::printf("\n  %-44s rel %.3e (%s accumulator, gate %.0e)\n", "silu vs the reference", rel,
+                    f64 ? "double" : "float", silu_tol);
+        if (!(rel <= silu_tol)) { std::printf("    *** over the gate ***\n"); ++bad; }
         sycl::free(d_x, dpct::get_in_order_queue());
     }
 

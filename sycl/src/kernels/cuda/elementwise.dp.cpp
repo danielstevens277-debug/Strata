@@ -113,6 +113,14 @@ __dpct_inline__ void to_bf16_kernel(const float *__restrict__ x,
     if (i < n) y[i] = bf16_from_f32(x[i]);
 }
 
+/// `x = x / (1 + exp(-x))`.
+///
+/// The DOUBLE is there to match `ref/gdn.py`'s numpy, which the A770 cannot build (see `fp64_kernels_ok`): the
+/// launch failed to compile there and, with nothing catching it, took the process down with it - so any model
+/// whose activation went through this kernel was dead on an A-series card.  The accumulator is a template
+/// parameter: a card with FP64 keeps the double, an Alchemist gets the float one (measured 3e-8 relative in
+/// elementwise_parity, against a 1e-6 gate).
+template <typename ACC>
 __dpct_inline__ void silu_kernel(float *__restrict__ x, int64_t n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
     const int64_t i =
@@ -122,9 +130,12 @@ __dpct_inline__ void silu_kernel(float *__restrict__ x, int64_t n) {
     // DOUBLE then cast, matching `ref/gdn.py`'s numpy: its arrays are f32 but `np.exp` on an f32 array is
     // computed to f32 precision by a different algorithm than `expf`, and the reference is the oracle.  The
     // difference is in the last bits and this is one line.
-    const double v = (double) x[i];
-    x[i] = (float)(v / (1.0 + sycl::exp(-v)));
+    const ACC v = (ACC) x[i];
+    x[i] = (float)(v / ((ACC) 1 + sycl::exp(-v)));
 }
+
+__dpct_inline__ void silu_kernel_f64(float *__restrict__ x, int64_t n) { silu_kernel<double>(x, n); }
+__dpct_inline__ void silu_kernel_f32(float *__restrict__ x, int64_t n) { silu_kernel<float>(x, n); }
 
 /// A bounded launch: a zero-length grid is illegal, and `n == 0` is a real call (an empty selection).
 inline unsigned grid_for(int64_t n) { return (unsigned) ((n + THREADS - 1) / THREADS); }
@@ -330,18 +341,21 @@ void silu_inplace(float* x, int64_t n, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<dpct_kernel_name<class silu_kernel_4d1386>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid_for(n)) *
-                                      sycl::range(1, 1, THREADS),
-                                  sycl::range(1, 1, THREADS)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    silu_kernel(x, n);
-                });
+        const sycl::nd_range<3> rng(sycl::range(1, 1, grid_for(n)) * sycl::range(1, 1, THREADS),
+                                    sycl::range(1, 1, THREADS));
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class silu_kernel_4d1386>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        silu_kernel_f64(x, n);
+                    });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class silu_kernel_4d1386_f32>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        silu_kernel_f32(x, n);
+                    });
+        }
     }
     check_launch("silu_inplace");
     sync_if_needed(stream, "silu_inplace");

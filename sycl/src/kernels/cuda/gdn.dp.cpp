@@ -227,15 +227,6 @@ runtimes. You may need to adjust the code.
         py[i] = po[i] * inv * ssm_norm[i] * sigmoid_f(pz[i]);
 }
 
-/// **`aspect::fp64` IS NOT THE QUESTION, AND ON THE TARGET CARD IT LIES.**  An A770 running with
-/// `OverrideDefaultFP64Settings=1` (the setting Strata's own launch config carries) REPORTS the fp64 aspect -
-/// the override raises the card's advertised FP64 support - while IGC still refuses to build THIS kernel, whose
-/// double sum sits in local memory and crosses a sub-group shuffle.  The arch id is the fact that does not move,
-/// so the double instantiation is chosen only off Alchemist.
-inline bool gdn_use_f64(const sycl::device& d) {
-    return d.has(sycl::aspect::fp64) && strata::intel_gpu_gen(d) != strata::IntelGpuGen::Alchemist;
-}
-
 /// The two accumulator widths the launchers choose between.  Distinct kernel names, because each is a separate
 /// device image: on a card without FP64 the double one is never launched and so never built.
 __dpct_inline__ void gdn_l2_kernel_f64(float *__restrict__ x, int cols, float eps) { gdn_l2_kernel<double>(x, cols, eps); }
@@ -329,7 +320,7 @@ void gdn_l2_norm(float *x, int64_t rows, int64_t cols, float eps,
         // absent there and the check calls std::terminate, so the float path below never existed.
         const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned) rows) * sycl::range(1, 1, 32),
                                     sycl::range(1, 1, 32));
-        if (gdn_use_f64(strata::q_of(stream)->get_device())) {
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
             strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
                 ->template parallel_for<dpct_kernel_name<class gdn_l2_kernel_fcfb3d_f64>>(
                     rng, exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
@@ -410,7 +401,7 @@ void gdn_out_norm(const float *o, const float *z, const float *ssm_norm,
             sycl::ext::oneapi::experimental::use_root_sync};
         const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned) h_v) * sycl::range(1, 1, 32),
                                     sycl::range(1, 1, 32));
-        if (gdn_use_f64(strata::q_of(stream)->get_device())) {   // see gdn_l2_norm
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {   // see gdn_l2_norm
             strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
                 ->template parallel_for<dpct_kernel_name<class gdn_out_norm_kernel_9883e0_f64>>(
                     rng, exp_props, [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {

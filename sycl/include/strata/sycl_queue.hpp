@@ -166,6 +166,17 @@ inline bool bm_default_on(const char* name, const sycl::device& d, bool bm_defau
     if (v != nullptr && v[0] != '\0') return v[0] != '0';
     return bm_default && intel_gpu_gen(d) == IntelGpuGen::Battlemage;
 }
+// May a kernel that was transcribed from a FLOAT64 reference keep its double arithmetic on this card?
+//
+// An Arc A-series (Alchemist: the A770) has no FP64 units.  Worse than slow, IGC refuses to BUILD some of those kernels
+// there - "Double type is not supported on this platform" - when the double lives in local memory or crosses a sub-group
+// shuffle, and the DP emulation (IGC_EnableDPEmulation=1) does not cover those two cases.  `aspect::fp64` is not a safe
+// question either: `OverrideDefaultFP64Settings=1` - which Strata's own launch config carries for the A770 - makes the
+// runtime REPORT the aspect while the build still fails.  The architecture id does not move, so it decides.
+// A card with FP64 keeps the double instantiation, bitwise with the reference; an Alchemist gets the float one.
+inline bool fp64_kernels_ok(const sycl::device& d) {
+    return d.has(sycl::aspect::fp64) && intel_gpu_gen(d) != IntelGpuGen::Alchemist;
+}
 }  // namespace strata
 
 #include <cstdint>
