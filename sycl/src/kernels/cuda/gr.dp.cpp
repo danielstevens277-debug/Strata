@@ -75,33 +75,8 @@ __dpct_inline__ float sigmoid_f(float x) {
     return 1.0f / (1.0f + sycl::native::exp(-x));
 }
 
-__dpct_inline__ double warp_sum(double v) {
-    /*
-DPCT1108: '__shfl_down_sync' was migrated with the experimental feature
-masked sub_group function which may not be supported by all compilers or
-runtimes. You may need to adjust the code.
-*/
-    /*
-DPCT1121: Make sure that the "v" which is used in the SYCL group
-function/algorithm is initialized.
-*/
-#pragma unroll
-    for (int off = 16; off > 0; off >>= 1) v +=
-        dpct::experimental::shift_sub_group_left(
-            0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v,
-            off);
-    /*
-    DPCT1108: '__shfl_sync' was migrated with the experimental feature masked
-    sub_group function which may not be supported by all compilers or runtimes.
-    You may need to adjust the code.
-    */
-    /*
-    DPCT1121: Make sure that the "v" which is used in the SYCL group
-    function/algorithm is initialized.
-    */
-    return dpct::experimental::select_from_sub_group(
-        0xFFFFFFFFu, sycl::ext::oneapi::this_work_item::get_sub_group(), v, 0);
-}
+/// (the double sub-group reduction that stood here went with block_sum: nothing else called it, and its type alone is
+/// enough to fail an Arc module.)
 
 __dpct_inline__ float warp_sumf(float v) {
     /*
@@ -137,9 +112,8 @@ function/algorithm is initialized.
 /// The scratch is taken as `double*` and reinterpreted as `float*` rather than changing the callers' shared
 /// arrays, because `double scratch[8]` is 64 bytes and so is at least as large as the `float[8]` this needs -
 /// the cast cannot overrun, and it keeps the change to one function instead of one per caller.
-inline float block_sumf(float v, double *scratch_raw) {
+inline float block_sumf(float v, float *scratch) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    float *scratch = (float *)scratch_raw;
     // The leading barrier is not decoration - see the note on `block_sum` above: the result is read straight out
     // of `scratch[0]` by every thread and a later call reuses the array, so without it a fast thread can
     // overwrite `scratch[0]` before a slow one has read the previous result.
@@ -173,63 +147,21 @@ inline float block_sumf(float v, double *scratch_raw) {
     return scratch[0];
 }
 
-/// Block-wide sum in DOUBLE, broadcast to every thread.
-///
-/// Double because `ref/gr.py` reduces in float64 for the norm and the bottleneck, and because a block-wide
-/// f32 sum of 2560 squares is a different number from the reference's; the shuffle tree here also reorders
-/// the additions, so the only defence is enough precision that the order stops mattering.
-///
-/// The leading `__syncthreads()` is not decoration: the result is read straight out of `scratch[0]` by every
-/// thread, and a later call reuses the same array.  Without a barrier on entry a fast thread can overwrite
-/// `scratch[0]` before a slow one has read the previous result - a race that is invisible in most runs.
-double block_sum(double v, double* scratch) {
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    item_ct1.barrier();
-    const int lane = item_ct1.get_local_id(2) & 31,
-              warp = item_ct1.get_local_id(2) >> 5;
-    v = warp_sum(v);
-    if (lane == 0) scratch[warp] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
-    const int nw = ((int)item_ct1.get_local_range(2) + 31) >> 5;
-    v = (item_ct1.get_local_id(2) < nw) ? scratch[item_ct1.get_local_id(2)]
-                                        : 0.0;
-    if (warp == 0) v = warp_sum(v);
-    if (item_ct1.get_local_id(2) == 0) scratch[0] = v;
-    /*
-    DPCT1065: Consider replacing sycl::nd_item::barrier() with
-    sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
-    performance if there is no access to global memory.
-    */
-    item_ct1.barrier();
-    return scratch[0];
-}
+/// (the double block-wide sum that stood here was DEAD - its only caller was itself - and on a card without FP64 a
+/// single `double` in the translation unit fails the entire kernel module, which is exactly what an A770 said:
+/// "'double' is not supported".  Deleted rather than guarded: nothing called it, and a template would still leave the
+/// type in the module.)
 
-/// `hc` blocks, one per residual stream: per-stream RMSNorm, then the activated stream in both forms.
-///
-/// ggml_rms_norm reduces over ne[0], and ne[0] is n_embd, so the reduction is PER STREAM.  The `[n_embd, hc]`
-/// gamma then scales each stream individually.
-///
-/// A per-thread accumulator is only a sum when the block is narrower than the row, which is why this is a
-/// block reduction: with `n_embd` equal to the thread count every thread would hold exactly one element and
-/// normalise by its own square.  That mistake is silent - it produces a plausible vector of the right shape -
-/// and it is what `gr_parity`'s `mixed vs reference` caught at 2.0e+01 in round 196.
 template <bool FP32_ACT>
 __dpct_inline__ void gr_norm_kernel(const float *__restrict__ R,
                                     const float *__restrict__ w_norm, float eps,
                                     int n_embd, float *__restrict__ xn,
                                     uint16_t *__restrict__ xq) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<double[8]>(
+// FLOAT, not double: nothing stored in it was ever a double (block_sumf read the same bytes as float), and on
+    // Alchemist a single `double` type anywhere in the translation unit fails the WHOLE module - "'double' is not
+    // supported in 'Intel(R) Arc(TM) A770 Graphics' device" - which is how this test died with no output at all.
+    auto &scratch = *sycl::ext::oneapi::group_local_memory_for_overwrite<float[8]>(
     sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const int c = item_ct1.get_group(2);
     const float* Rc = R + (size_t) c * n_embd;
