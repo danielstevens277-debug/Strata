@@ -709,6 +709,10 @@ int fused_multi_lds_parity(const float* d_norm, const uint16_t* d_down, const ui
 }  // namespace
 
 int main(int argc, char** argv) {
+    // UNBUFFERED.  A parity test that aborts inside a launch (a kernel the driver refuses, a capture it will not do)
+    // otherwise loses every line it had already printed, because stdout is block-buffered the moment it is redirected -
+    // which is how these tests run.  The failure then reads as "no output at all", which hides what it was doing.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
     bool selftest = false;
     for (int i = 1; i < argc; ++i) {
         if (std::string(argv[i]) == "--selftest") selftest = true;
