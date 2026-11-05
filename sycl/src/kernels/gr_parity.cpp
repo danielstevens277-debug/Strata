@@ -173,7 +173,6 @@ void select_activation_mode(int mode) {
 // At R=1 and eps=0, xn=gamma exactly; any rounding in xn or lo comes from the selected activation contract.
 int scalar_activation_contract() {
     using namespace strata::kernels;
-    std::printf("  [scalar] alloc\n");
     const GrShapes sh{2, 1, 2};
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t* d_weights = nullptr;
@@ -197,7 +196,6 @@ int scalar_activation_contract() {
               d_scratch = (void *)sycl::malloc_device(
                   gr_workspace_bytes(sh), dpct::get_in_order_queue())),
           "scalar scratch");
-    std::printf("  [scalar] workspace: %zu bytes\n", (size_t) gr_workspace_bytes(sh));
     GrWorkspace ws;
     gr_workspace_init(sh, d_scratch, ws);
     const float ones[] = {1.0f, 1.0f};
@@ -249,9 +247,7 @@ int scalar_activation_contract() {
             select_activation_mode(mode);
             gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f,
                     sh, ws, d_mixed, d_inject, stream);
-            std::printf("  [scalar] launching gamma %.4f mode %d\n", gamma, mode);
             check(DPCT_CHECK_ERROR(stream->wait()), "scalar warmup");
-            std::printf("  [scalar] warmup done\n");            check(DPCT_CHECK_ERROR(stream->wait()), "scalar warmup");
             if (!graphs_enabled()) {
                 gr_read(d_R, d_norm, d_weights, d_weights + 4, d_weights + 8, 0.0f, sh, ws, d_mixed, d_inject, stream);
                 check(DPCT_CHECK_ERROR(stream->wait()), "scalar direct sync");
@@ -787,14 +783,11 @@ static int gr_main(int argc, char** argv) {
     for (size_t i = 0; i < w_inject.size(); ++i) q_inject[i] = bf16_bits(w_inject[i]);
 
     // ---- device side
-    std::printf("  [main] fixtures built, first allocation\n");
-    std::fflush(stdout);
     float *d_R = nullptr, *d_norm = nullptr, *d_mixed = nullptr, *d_inject = nullptr;
     uint16_t *d_down = nullptr, *d_up = nullptr, *d_inj = nullptr;
     check(DPCT_CHECK_ERROR(d_R = sycl::malloc_device<float>(
                                R.size(), dpct::get_in_order_queue())),
           "m R");
-    std::printf("  [main] R allocated\n");
     check(DPCT_CHECK_ERROR(d_norm = sycl::malloc_device<float>(
                                w_norm.size(), dpct::get_in_order_queue())),
           "m norm");
@@ -868,14 +861,7 @@ static int gr_main(int argc, char** argv) {
           "m ws");
     strata::kernels::GrWorkspace ws;
     strata::kernels::gr_workspace_init(sh, d_ws_raw, ws);
-    std::printf("  [main] inputs uploaded, first gr_read\n"); std::fflush(stdout);
-    try {
-        strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
-        std::printf("  [main] gr_read returned\n");
-    } catch (const std::exception& e) {
-        std::printf("  [main] gr_read threw: %s\n", e.what()); std::fflush(stdout); return 1;
-    }
-
+    strata::kernels::gr_read(d_R, d_norm, d_down, d_up, d_inj, eps, sh, ws, d_mixed, d_inject, nullptr);
     std::vector<float> got_mixed((size_t) n_embd), got_inject((size_t) hc);
     check(DPCT_CHECK_ERROR((dpct::get_current_device().queues_wait_and_throw(), dpct::get_in_order_queue())
                                .memcpy(got_mixed.data(), d_mixed,
