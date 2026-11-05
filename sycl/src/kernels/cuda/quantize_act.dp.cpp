@@ -27,6 +27,8 @@
 #include <dpct/dpct.hpp>
 #include "strata/sycl_queue.hpp"
 #include "strata/kernels/quantize_act.hpp"
+#include <type_traits>
+
 #include "strata/kernels/f16_bits.hpp"
 
 #include <cmath>
@@ -46,6 +48,11 @@ constexpr int QK8_0 = 32;
 // inf, and this file's fixture is O(1) throughout, so it passed.  A numpy-generated oracle caught it on its
 // first run.  Three copies of a converter whose failure mode is silent wrong bits was two copies too many.
 
+/// The rounding is `rint(x / d)` where `d` is the block's amax/127: the DIVISION is done in double because an
+/// FP32 divide followed by rint is not the same rounding at a tie.  On an Alchemist that double is a device
+/// build failure (see `fp64_kernels_ok`), and it was an UNCATCHABLE one here - the test binary aborted with an
+/// empty log - so the accumulator is a template parameter and the launcher picks by card.
+template <typename ACC>
 __dpct_inline__ void quantize_q8_0_kernel(const float *__restrict__ x,
                                           uint8_t *__restrict__ blocks,
                                           long long n_blocks) {
@@ -75,11 +82,34 @@ __dpct_inline__ void quantize_q8_0_kernel(const float *__restrict__ x,
     out[0] = (uint8_t) (d16bits & 0xFF);
     out[1] = (uint8_t) (d16bits >> 8);
 
-    // double division, matching the reference exactly (subtlety 2)
+    // Division in double where the card has it, matching the reference exactly (subtlety 2).
     for (int i = 0; i < QK8_0; ++i) {
-        double q = sycl::rint((double)xb[i] / (double)d32);
-        if (q > 127.0) q = 127.0;
-        if (q < -128.0) q = -128.0;
+        ACC q;
+        if constexpr (std::is_same_v<ACC, double>) {
+            q = sycl::rint((ACC) xb[i] / (ACC) d32);
+        } else {
+            // **THE FLOAT PATH STILL GETS THE TIES RIGHT, AND THAT IS THE WHOLE DIFFICULTY.**  The quotient is
+            // 24-bit, so a value whose true quotient is a hair off n+0.5 can land exactly ON n+0.5 here, where
+            // the reference's double division (53-bit) still sees the hair.  `rint` then takes the tie to even
+            // and flips one q8 value per few hundred blocks - 1 byte in 21760 on this fixture's `random
+            // normal`, which is exactly what the first float version did.
+            //
+            // The exact remainder settles it without an FP64 unit: `fma(-q0, d, x)` is the correctly rounded
+            // x - q0*d, i.e. the part the float quotient threw away, and its sign says which side of the tie
+            // the true quotient is on.  A remainder of exactly 0 is a genuine tie, and there half-to-even is
+            // right - which is `rint`'s answer anyway.
+            const float x0 = xb[i];
+            const float q0 = x0 / d32;
+            const float r = sycl::fma(-q0, d32, x0);
+            const float lo = sycl::floor(q0);
+            if (q0 - lo == 0.5f && r != 0.0f) {
+                q = (r > 0.0f) ? lo + 1.0f : lo;
+            } else {
+                q = sycl::rint(q0);
+            }
+        }
+        if (q > (ACC) 127) q = (ACC) 127;
+        if (q < (ACC) -128) q = (ACC) -128;
         out[2 + i] = (uint8_t) (int8_t) q;
     }
 }
@@ -301,6 +331,12 @@ __dpct_inline__ void dequant_q8_K_kernel(const uint8_t *__restrict__ blocks,
     for (int i = 0; i < QK_K; ++i) out[i] = (float)qs[i] * d;
 }
 
+/// The two accumulator widths the launcher chooses between (see `fp64_kernels_ok`).
+__dpct_inline__ void quantize_q8_0_kernel_f64(const float *__restrict__ x, uint8_t *__restrict__ blocks,
+                                              long long n_blocks) { quantize_q8_0_kernel<double>(x, blocks, n_blocks); }
+__dpct_inline__ void quantize_q8_0_kernel_f32(const float *__restrict__ x, uint8_t *__restrict__ blocks,
+                                              long long n_blocks) { quantize_q8_0_kernel<float>(x, blocks, n_blocks); }
+
 }  // namespace
 
 void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
@@ -315,18 +351,21 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_5451b9>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    quantize_q8_0_kernel(x, blocks, nb);
-                });
+        const sycl::nd_range<3> rng(sycl::range(1, 1, grid) * sycl::range(1, 1, threads),
+                                    sycl::range(1, 1, threads));
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_5451b9>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        quantize_q8_0_kernel_f64(x, blocks, nb);
+                    });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class quantize_q8_0_kernel_5451b9_f32>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        quantize_q8_0_kernel_f32(x, blocks, nb);
+                    });
+        }
     }
     /*
     DPCT1010: SYCL uses exceptions to report errors and does not use the
