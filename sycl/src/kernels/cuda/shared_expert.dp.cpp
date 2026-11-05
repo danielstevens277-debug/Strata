@@ -184,6 +184,13 @@ __dpct_inline__ void scalar_gate_kernel_f32(const uint16_t *x, const uint16_t *w
     scalar_gate_kernel<float>(x, w, o, n);
 }
 
+__dpct_inline__ void moe_combine_kernel_f64(const float *p, const float *w, const float *sh, float *y, int n, int k, int hs) {
+    moe_combine_kernel<double>(p, w, sh, y, n, k, hs);
+}
+__dpct_inline__ void moe_combine_kernel_f32(const float *p, const float *w, const float *sh, float *y, int n, int k, int hs) {
+    moe_combine_kernel<float>(p, w, sh, y, n, k, hs);
+}
+
 __dpct_inline__ void scale_kernel(float *__restrict__ out,
                                   const float *__restrict__ g, int n) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
@@ -208,6 +215,7 @@ void native_scalar_sigmoid_multi_kernel(float* gate) {   // thread t = token t, 
 }
 
 /// The MoE block's final combination.  See the header for the two readings it exists to pin.
+template <typename ACC>
 __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
                                         const float *__restrict__ weights,
                                         const float *__restrict__ shared,
@@ -219,12 +227,12 @@ __dpct_inline__ void moe_combine_kernel(const float *__restrict__ parts,
     if (j >= n_embd) return;
     // Accumulate in DOUBLE, in the reference's own order (`for i in range(k): out[t] += w[t,i] * g[0]`).
     // f32 would be defensible for ten terms, but the reference is float64 and this is one line.
-    double acc = 0.0;
+    ACC acc = (ACC) 0;
 #pragma unroll
     for (int e = 0; e < k; ++e) acc +=
-        (double)weights[e] * (double)parts[(size_t)e * n_embd + j];
+        (ACC)weights[e] * (ACC)parts[(size_t)e * n_embd + j];
     // The SHARED output is added PLAIN - not router-weighted, not renormalised against the routed sum.
-    if (has_shared) acc += (double) shared[j];
+    if (has_shared) acc += (ACC) shared[j];
     y[j] = (float) acc;
 }
 
@@ -690,24 +698,24 @@ void moe_combine(const float *parts, const float *weights, const float *shared,
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
             ->submit([&](sycl::handler &cgh) {
                 int shared_nullptr_ct6 = shared != nullptr;
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class moe_combine_kernel_c03916>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, grid) *
-                                          sycl::range(1, 1, THREADS),
-                                      sycl::range(1, 1, THREADS)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        moe_combine_kernel(parts, weights, shared, y,
-                                           (int)n_embd, (int)k,
-                                           shared_nullptr_ct6);
-                    });
+                const sycl::nd_range<3> rng(sycl::range(1, 1, grid) * sycl::range(1, 1, THREADS),
+                                            sycl::range(1, 1, THREADS));
+                if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+                    cgh.parallel_for<dpct_kernel_name<class moe_combine_kernel_c03916_f64>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            moe_combine_kernel_f64(parts, weights, shared, y, (int)n_embd,
+                                                   (int)k, shared_nullptr_ct6);
+                        });
+                } else {
+                    cgh.parallel_for<dpct_kernel_name<class moe_combine_kernel_c03916_f32>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            moe_combine_kernel_f32(parts, weights, shared, y, (int)n_embd,
+                                                   (int)k, shared_nullptr_ct6);
+                        });
+                }
             });
     }
     if (stream == nullptr) {

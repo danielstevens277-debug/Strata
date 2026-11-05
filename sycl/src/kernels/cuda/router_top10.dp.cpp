@@ -73,13 +73,22 @@ constexpr int RT_MAX_THREADS = 512;
 // A tree sum brackets the serial reciprocal; ambiguous rounding falls back to
 // the original ascending sum. Selection and renormalisation stay in subgroup 0.
 template <bool FORCE_SERIAL>
+/// The relative width of the band the fast path uses to decide whether the tree sum's own ordering error can
+/// move the FLOAT reciprocal it is about to take (`f_lo == f_hi` below).  `double` can express the 2**-40 the
+/// CUDA original used - roughly 256 ulps, generous for a 512-term tree; `float` gets the same 256-ulp slack,
+/// which is 2**-16.  On Alchemist that band is usually wide enough to fail the test, and the kernel then takes
+/// the serial ascending sum: slower, and correct, which is the right way round for a guard.
+template <typename ACC>
+constexpr ACC kSumBand = sizeof(ACC) == 8 ? (ACC) 0x1p-40 : (ACC) 0x1p-16;
+
+template <bool FORCE_SERIAL, typename ACC>
 void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k,
                       int* ids, float* weights) {
     const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
     strata::kprof::kp(&q, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& h) {
-        sycl::local_accessor<double, 1> s_ex(sycl::range<1>(n_expert), h);
+        sycl::local_accessor<ACC, 1> s_ex(sycl::range<1>(n_expert), h);
         sycl::local_accessor<float, 1> s_red(sycl::range<1>(RT_MAX_THREADS / 32), h);
-        sycl::local_accessor<double, 1> s_dred(sycl::range<1>(RT_MAX_THREADS / 32), h);
+        sycl::local_accessor<ACC, 1> s_dred(sycl::range<1>(RT_MAX_THREADS / 32), h);
         sycl::local_accessor<float, 1> s_inv(sycl::range<1>(1), h);
         h.parallel_for(sycl::nd_range<1>(sycl::range<1>((size_t)n_tokens * threads),
                                         sycl::range<1>(threads)),
@@ -104,9 +113,9 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                 }
                 bar();
                 mx = s_red[0];
-                double part = 0.0;
+                ACC part = (ACC) 0;
                 for (int e = tid; e < n_expert; e += nt) {
-                    const double x = sycl::exp((double)l[e] - (double)mx);
+                    const ACC x = sycl::exp((ACC)l[e] - (ACC)mx);
                     s_ex[e] = x;
                     part += x;
                 }
@@ -114,18 +123,18 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                     part += sycl::permute_group_by_xor(sg, part, off);
                 if (lane == 0) s_dred[warp] = part;
                 bar();
-                double tot = 0.0;
+                ACC tot = (ACC) 0;
                 for (int w = 0; w < nw; ++w) tot += s_dred[w];
-                const double lo = tot * (1.0 - 0x1p-40), hi = tot * (1.0 + 0x1p-40);
+                const ACC lo = tot * ((ACC) 1 - kSumBand<ACC>), hi = tot * ((ACC) 1 + kSumBand<ACC>);
                 const float f_lo = (float)(1.0 / hi), f_hi = (float)(1.0 / lo);
                 float inv;
-                if (!FORCE_SERIAL && tot >= 1.0 && hi < 1e300 && f_lo == f_hi) {
+                if (!FORCE_SERIAL && tot >= (ACC) 1 && hi < (ACC) 1e300 && f_lo == f_hi) {
                     inv = f_lo;
                 } else {
                     if (tid == 0) {
-                        double sum = 0.0;
+                        ACC sum = (ACC) 0;
                         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
-                        s_inv[0] = (float)(1.0 / sum);
+                        s_inv[0] = (float)((ACC) 1 / sum);
                     }
                     bar();
                     inv = s_inv[0];
@@ -157,26 +166,44 @@ void launch_sycl_fast(sycl::queue& q, const float* logits, int n_tokens, int n_e
                     nsel = i + 1;
                 }
                 if (nsel == k) {
-                    double s = 0.0;
-                    for (int i = 0; i < k; ++i) s += (double)sycl::select_from_group(sg, my_w, i);
-                    const double sc = sycl::fmax(s, 6.103515625e-05);
+                    ACC s = (ACC) 0;
+                    for (int i = 0; i < k; ++i) s += (ACC)sycl::select_from_group(sg, my_w, i);
+                    const ACC sc = sycl::fmax(s, (ACC) 6.103515625e-05);
                     if (lane < k) {
                         ids[(size_t)t * k + lane] = my_id;
-                        weights[(size_t)t * k + lane] = (float)((double)my_w / sc);
+                        weights[(size_t)t * k + lane] = (float)((ACC)my_w / sc);
                     }
                 } else {
                     if (lane < nsel) { ids[(size_t)t * k + lane] = my_id; weights[(size_t)t * k + lane] = my_w; }
                     sycl::group_barrier(sg);
                     if (lane == 0) {
-                        double s = 0.0;
-                        for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
-                        const double sc = sycl::fmax(s, 6.103515625e-05);
+                        ACC s = (ACC) 0;
+                        for (int i = 0; i < k; ++i) s += (ACC)weights[(size_t)t * k + i];
+                        const ACC sc = sycl::fmax(s, (ACC) 6.103515625e-05);
                         for (int i = 0; i < k; ++i)
-                            weights[(size_t)t * k + i] = (float)((double)weights[(size_t)t * k + i] / sc);
+                            weights[(size_t)t * k + i] = (float)((ACC)weights[(size_t)t * k + i] / sc);
                     }
                 }
             });
     });
+}
+
+/// SMEM for `router_top10_kernel<ACC>`: the taken-mask, then n_expert ACCs, then n_expert floats.
+/// The mask is rounded to 16 B so both arrays stay aligned without an offset parameter.
+template <typename ACC>
+constexpr size_t router_smem(int n_expert) {
+    return (((size_t) n_expert + 15u) & ~(size_t) 15u) + (size_t) n_expert * (sizeof(ACC) + sizeof(float));
+}
+
+/// `launch_sycl_fast` with the accumulator chosen from the card.  The callers keep their shape; only the type
+/// differs, and on an Alchemist that difference is the one between running and not launching at all.
+template <bool FORCE_SERIAL>
+void launch_sycl_fast_auto(sycl::queue& q, const float* logits, int n_tokens, int n_expert, int k,
+                           int* ids, float* weights) {
+    if (strata::fp64_kernels_ok(q.get_device()))
+        launch_sycl_fast<FORCE_SERIAL, double>(q, logits, n_tokens, n_expert, k, ids, weights);
+    else
+        launch_sycl_fast<FORCE_SERIAL, float>(q, logits, n_tokens, n_expert, k, ids, weights);
 }
 
 /// One BLOCK per token, so the reductions have somewhere to happen.  `n_tokens` is 1 in decode; the grid keeps
@@ -187,6 +214,7 @@ router_top10_kernel exceeds 128 bytes and may cause high register pressure.
 Consult with your hardware vendor to find the total register size available and
 adjust the code, or use smaller sub-group size to avoid high register pressure.
 */
+template <typename ACC>
 __dpct_inline__ void router_top10_kernel(const float *__restrict__ logits,
                                          int n_tokens, int n_expert, int k,
                                          int *__restrict__ ids,
@@ -198,14 +226,14 @@ __dpct_inline__ void router_top10_kernel(const float *__restrict__ logits,
     auto s_raw = (unsigned char *)dpct_local;
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
     unsigned char* s_taken = s_raw;
-    double* s_ex = (double*) (s_raw + taken_bytes);
+    ACC* s_ex = (ACC*) (s_raw + taken_bytes);
     auto &s_red = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         float[RT_MAX_THREADS / 32]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
     auto &s_rid = *sycl::ext::oneapi::group_local_memory_for_overwrite<
         int[RT_MAX_THREADS / 32]>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
-    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<double>(
+    auto &s_sum = *sycl::ext::oneapi::group_local_memory_for_overwrite<ACC>(
         sycl::ext::oneapi::this_work_item::get_work_group<3>());
 
     const int t = item_ct1.get_group(2);
@@ -263,7 +291,7 @@ runtimes. You may need to adjust the code.
     // and was 5,632 serial calls before; it is 512 parallel ones now.
 #pragma unroll
     for (int e = tid; e < n_expert; e += nt)
-        s_ex[e] = sycl::exp((double)l[e] - (double)mx);
+        s_ex[e] = sycl::exp((ACC)l[e] - (ACC)mx);
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
     sycl::nd_item::barrier(sycl::access::fence_space::local_space) for better
@@ -273,7 +301,7 @@ runtimes. You may need to adjust the code.
 
     // ---- the sum, ascending, on one thread: see the note above on why this is NOT parallelised.
     if (tid == 0) {
-        double sum = 0.0;
+        ACC sum = (ACC) 0;
 #pragma unroll
         for (int e = 0; e < n_expert; ++e) sum += s_ex[e];
         s_sum = sum;
@@ -284,7 +312,7 @@ runtimes. You may need to adjust the code.
     performance if there is no access to global memory.
     */
     item_ct1.barrier();
-    const float inv = (float) (1.0 / s_sum);
+    const float inv = (float) ((ACC) 1 / s_sum);
 
     // ---- the selection, by rank.  `p[e] = (float)(s_ex[e] * inv)` reproduces the old expression exactly:
     // `(float)(exp((double) l[e] - (double) mx) * inv)` with `inv` a FLOAT.
@@ -416,13 +444,13 @@ runtimes. You may need to adjust the code.
 
     // ---- renormalise, with ggml's lower clamp.  Order preserved.
     if (tid == 0) {
-        double s = 0.0;
+        ACC s = (ACC) 0;
 #pragma unroll
-        for (int i = 0; i < k; ++i) s += (double)weights[(size_t)t * k + i];
-        const double sc = sycl::fmax(s, 6.103515625e-05); // 2**-14
+        for (int i = 0; i < k; ++i) s += (ACC)weights[(size_t)t * k + i];
+        const ACC sc = sycl::fmax(s, (ACC) 6.103515625e-05); // 2**-14
 #pragma unroll
         for (int i = 0; i < k; ++i)
-            weights[(size_t) t * k + i] = (float) ((double) weights[(size_t) t * k + i] / sc);
+            weights[(size_t) t * k + i] = (float) ((ACC) weights[(size_t) t * k + i] / sc);
     }
 }
 
@@ -656,20 +684,28 @@ bool router_top10_variant(const float* logits, int n_tokens, int n_expert, int k
     if (n_tokens <= 0 || n_expert <= 64 || n_expert > 512 || k <= 0 || k > 32 || variant < 0 || variant > 2)
         return false;
     auto& q = *strata::q_of(stream);
-    if (variant == 1) launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
-    else if (variant == 2) launch_sycl_fast<true>(q, logits, n_tokens, n_expert, k, ids, weights);
+    if (variant == 1) launch_sycl_fast_auto<false>(q, logits, n_tokens, n_expert, k, ids, weights);
+    else if (variant == 2) launch_sycl_fast_auto<true>(q, logits, n_tokens, n_expert, k, ids, weights);
     else {
         const int threads = (std::min(n_expert, RT_MAX_THREADS) + 31) & ~31;
-        const size_t taken_bytes = ((size_t)n_expert + 15u) & ~size_t(15);
-        const size_t smem = taken_bytes + n_expert * (sizeof(double) + sizeof(float));
+        const bool f64 = strata::fp64_kernels_ok(q.get_device());
+        const size_t smem = f64 ? router_smem<double>(n_expert) : router_smem<float>(n_expert);
         strata::kprof::kp(&q, __FILE__, __func__, __LINE__)->submit([&](sycl::handler& h) {
             sycl::local_accessor<uint8_t, 1> local(sycl::range<1>(smem), h);
-            h.parallel_for(sycl::nd_range<3>(sycl::range<3>(1, 1, (size_t)n_tokens * threads),
-                                             sycl::range<3>(1, 1, threads)),
-                [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
-                    router_top10_kernel(logits, n_tokens, n_expert, k, ids, weights,
-                        local.get_multi_ptr<sycl::access::decorated::no>().get());
-                });
+            auto* slm = local.get_multi_ptr<sycl::access::decorated::no>().get();
+            const sycl::nd_range<3> rng(sycl::range<3>(1, 1, (size_t)n_tokens * threads),
+                                        sycl::range<3>(1, 1, threads));
+            if (f64) {
+                h.parallel_for<dpct_kernel_name<class router_top10_kernel_var_f64>>(rng,
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                        router_top10_kernel<double>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                    });
+            } else {
+                h.parallel_for<dpct_kernel_name<class router_top10_kernel_var_f32>>(rng,
+                    [=](sycl::nd_item<3>) [[sycl::reqd_sub_group_size(32)]] {
+                        router_top10_kernel<float>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                    });
+            }
         });
     }
     if (stream == nullptr) q.wait_and_throw();
@@ -681,7 +717,7 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
                   int *ids, float *weights, void *stream) try {
     if (strata::a770_fast() && n_tokens > 0 && n_expert > 64 && n_expert <= 512 && k > 0 && k <= 32) {
         auto& q = *strata::q_of(stream);
-        launch_sycl_fast<false>(q, logits, n_tokens, n_expert, k, ids, weights);
+        launch_sycl_fast_auto<false>(q, logits, n_tokens, n_expert, k, ids, weights);
         if (stream == nullptr) q.wait_and_throw();
         return;
     }
@@ -740,14 +776,10 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
     // the selection's taken-mask, then n_expert doubles for the exponentials, then n_expert floats for the
     // probabilities.  The mask is first so the two aligned arrays need no offset parameter.
     const size_t taken_bytes = ((size_t) n_expert + 15u) & ~(size_t) 15u;
-    const size_t smem =
-        /*
-        DPCT1083: The size of local memory in the migrated code may be
-        different from the original code. Check that the allocated memory size
-        in the migrated code is correct.
-        */
-        taken_bytes + (size_t)n_expert * sizeof(double) +
-        (size_t)n_expert * sizeof(float);
+    // The exponent array is `ACC`: `router_smem` sizes it for the instantiation the card will get, and the
+    // DPCT1083 note above is why the two are computed by one function instead of inline here.
+    const bool f64 = strata::fp64_kernels_ok(strata::q_of(stream)->get_device());
+    const size_t smem = f64 ? router_smem<double>(n_expert) : router_smem<float>(n_expert);
     /*
     DPCT1049: The work-group size passed to the SYCL kernel may exceed the
     limit. To get the device limit, query info::device::max_work_group_size.
@@ -756,29 +788,29 @@ void router_top10(const float *logits, int n_tokens, int n_expert, int k,
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
             ->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range(smem), cgh);
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class router_top10_kernel_3e0655>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, (unsigned)n_tokens) *
-                                          sycl::range(1, 1, threads),
-                                      sycl::range(1, 1, threads)),
-                    exp_props,
-                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(
-                        32)]] {
-                        router_top10_kernel(
-                            logits, n_tokens, n_expert, k, ids, weights,
-                            dpct_local_acc_ct1
+                auto* slm = dpct_local_acc_ct1
                                 .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
+                                .get();
+                const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned)n_tokens) *
+                                                sycl::range(1, 1, threads),
+                                            sycl::range(1, 1, threads));
+                if (f64) {
+                    cgh.parallel_for<dpct_kernel_name<class router_top10_kernel_3e0655_f64>>(
+                        rng, exp_props,
+                        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                            router_top10_kernel<double>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                        });
+                } else {
+                    cgh.parallel_for<dpct_kernel_name<class router_top10_kernel_3e0655_f32>>(
+                        rng, exp_props,
+                        [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                            router_top10_kernel<float>(logits, n_tokens, n_expert, k, ids, weights, slm);
+                        });
+                }
             });
     }
     /*

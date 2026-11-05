@@ -167,6 +167,7 @@ kv_append_kernel(uint16_t *__restrict__ k_pool, uint16_t *__restrict__ v_pool,
 /// `pos`, which forced `pos` to be a host scalar, which meant a captured graph would replay the first token's
 /// position forever.  Doing it here reads the position from `pos_dev` like every other kernel, so the grid and
 /// the arguments are the same for every token and the graph replays correctly.
+template <typename ACC>
 __dpct_inline__ void indexer_key_append_kernel(
     const float *__restrict__ raw, const int32_t *__restrict__ pos_dev,
     int pos_base, const float *__restrict__ w_k_norm, float eps,
@@ -176,7 +177,7 @@ __dpct_inline__ void indexer_key_append_kernel(
     const float *__restrict__ sin_tab, const int32_t *__restrict__ mtab,
     uint8_t *dpct_local) {
     auto item_ct1 = sycl::ext::oneapi::this_work_item::get_nd_item<3>();
-    auto s_mean = (double *)dpct_local; // idx_dim doubles
+    auto s_mean = (ACC *)dpct_local; // idx_dim ACCs - the host sizes the SMEM to the instantiation
     const int d = item_ct1.get_local_id(2);
     /*
     DPCT1098: The '*' expression is used instead of the __ldg call. These
@@ -193,8 +194,8 @@ __dpct_inline__ void indexer_key_append_kernel(
     // The spare slot's key is `rms_norm(raw[0])`, which is CONSTANT for the sequence and is the only reason
     // cell 0's raw key has to be kept: the three-row tail no longer holds it after the first block.
     if (pos == 0) {
-        double p = (double) raw[d];
-        double ss = 0.0;
+        ACC p = (ACC) raw[d];
+        ACC ss = (ACC) 0;
         // Same order as the pooled path, so the two are comparable: sum of squares over the dims, sequential.
         // Every thread computes the same `ss` and uses only its own output element.
         //
@@ -204,7 +205,7 @@ __dpct_inline__ void indexer_key_append_kernel(
         // key comes out 0.4 f32 ulp away - close enough that only a BIT-EXACT assertion notices.  `__ddiv_rn`
         // and `__dsqrt_rn` pin the reciprocal square root for the same reason.
         for (int i = 0; i < idx_dim; ++i) {
-            const double v = (double) raw[i];
+            const ACC v = (ACC) raw[i];
             /*
             DPCT1013: The rounding mode could not be specified and the
             generated code may have different accuracy than the original code.
@@ -219,8 +220,8 @@ __dpct_inline__ void indexer_key_append_kernel(
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
         */
-        const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
-        float y = (float) (p * inv * (double) w_k_norm[d]);
+        const ACC inv = (ACC) 1 / sycl::sqrt(ss / (ACC)idx_dim + (ACC)eps);
+        float y = (float) (p * inv * (ACC) w_k_norm[d]);
         // The spare rotates at position 0 - ALWAYS row 0 of the table, whatever `pos_base` is, as the native
         // indexer's spare does.  At angle 0 the sine is exactly 0 in every scaling (sin(0) * mscale), so the
         // pair rotation reduces to `v * cos_tab[pair]` with no partner element to read (and no barrier).
@@ -246,7 +247,7 @@ __dpct_inline__ void indexer_key_append_kernel(
     // The mean of this block's r raw keys, in CELL order: the r-1 tail rows (slots 0..r-2) then the incoming
     // cell (slot r-1).  The sum of r f32 values is exact in double, so the mean's order cannot matter here -
     // but the order of the SUM OF SQUARES below can, and it is fixed to d ascending on both sides.
-    double m = 0.0;
+    ACC m = (ACC) 0;
     /*
 DPCT1013: The rounding mode could not be specified and the generated code
 may have different accuracy than the original code. Verify the correctness. SYCL
@@ -254,15 +255,15 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
 */
 #pragma unroll
     for (int j = 0; j < r - 1; ++j)
-        m = m + (double)tail[(size_t)j * idx_dim + d];
+        m = m + (ACC)tail[(size_t)j * idx_dim + d];
     /*
     DPCT1013: The rounding mode could not be specified and the generated
     code may have different accuracy than the original code. Verify the
     correctness. SYCL math built-in function rounding mode is aligned with
     OpenCL C 1.2 standard.
     */
-    m = m + (double)raw[d];
-    m = m / (double) r;
+    m = m + (ACC)raw[d];
+    m = m / (ACC) r;
     s_mean[d] = m;
     /*
     DPCT1065: Consider replacing sycl::nd_item::barrier() with
@@ -271,7 +272,7 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     */
     item_ct1.barrier();
 
-    double ss = 0.0;
+    ACC ss = (ACC) 0;
     /*
 DPCT1013: The rounding mode could not be specified and the generated code
 may have different accuracy than the original code. Verify the correctness. SYCL
@@ -285,10 +286,10 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     correctness. SYCL math built-in function rounding mode is aligned with
     OpenCL C 1.2 standard.
     */
-    const double inv = 1.0 / sycl::sqrt(ss / (double)idx_dim + (double)eps);
+    const ACC inv = (ACC) 1 / sycl::sqrt(ss / (ACC)idx_dim + (ACC)eps);
 
     const int b = pos / r;
-    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (double) w_k_norm[d]);
+    pooled[(size_t) b * idx_dim + d] = (float) (m * inv * (ACC) w_k_norm[d]);
     // The spare slot MOVES to b+1 and is rewritten with the same constant value.
     pooled[(size_t) (b + 1) * idx_dim + d] = dead[d];
     // The rotation position for this row, kept because a capture reader and the debug dumps want it.  It is the
@@ -323,6 +324,7 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
 
 /// One warp per indexer head, one block per pooled row; thread 0 sums the relu'd dots IN HEAD ORDER and maps
 /// the row's score onto its cells.  The reference's Relu is PER HEAD, so the dots cannot be summed first.
+template <typename ACC>
 __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
                                       const float *__restrict__ q_idx,
                                       const float *__restrict__ bias,
@@ -343,7 +345,7 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
     */
     const long long n_kv = (long long)*(step + kStepNKv);
     auto &s_dot =
-        *sycl::ext::oneapi::group_local_memory_for_overwrite<double[32]>(
+        *sycl::ext::oneapi::group_local_memory_for_overwrite<ACC[32]>(
             sycl::ext::oneapi::this_work_item::get_work_group<3>());
     const long long b = item_ct1.get_group(2);
     // A BLOCK PAST THE COMPLETED-BLOCK COUNT MUST DO NOTHING.  This is what lets the LAYER launch a CONSTANT
@@ -354,10 +356,10 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
     if (b > n_bid) return;
     const int wid = item_ct1.get_local_id(2) >> 5,
               lane = item_ct1.get_local_id(2) & 31;
-    if (wid == 0) s_dot[lane] = 0.0;     // thread 0 reads all idx_n_head entries; zero the unused ones
+    if (wid == 0) s_dot[lane] = (ACC) 0;     // thread 0 reads all idx_n_head entries; zero the unused ones
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
-    double acc = 0.0;
+    ACC acc = (ACC) 0;
 #pragma unroll
     for (int d = lane; d < idx_dim; d += 32)
         /*
@@ -366,8 +368,8 @@ __dpct_inline__ void qsa_index_kernel(const float *__restrict__ pooled,
         correctness. SYCL math built-in function rounding mode is aligned with
         OpenCL C 1.2 standard.
         */
-        acc = acc + (double)pooled[(size_t)b * idx_dim + d] *
-                        (double)q_idx[(size_t)wid * idx_dim + d];
+        acc = acc + (ACC)pooled[(size_t)b * idx_dim + d] *
+                        (ACC)q_idx[(size_t)wid * idx_dim + d];
     /*
 DPCT1108: '__shfl_xor_sync' was migrated with the experimental feature
 masked sub_group function which may not be supported by all compilers or
@@ -387,11 +389,11 @@ math built-in function rounding mode is aligned with OpenCL C 1.2 standard.
     item_ct1.barrier(sycl::access::fence_space::local_space);
 
     if (item_ct1.get_local_id(2) != 0) return;
-    double score = 0.0;
+    ACC score = (ACC) 0;
 #pragma unroll
     for (int h = 0; h < idx_n_head; ++h) score +=
-        (s_dot[h] > 0.0) ? s_dot[h] : 0.0;
-    if (bias != nullptr) score += (double) bias[b];
+        (s_dot[h] > (ACC) 0) ? s_dot[h] : (ACC) 0;
+    if (bias != nullptr) score += (ACC) bias[b];
     // cell_block: cells of block b for b < n_bid, and the WHOLE incomplete tail for b == n_bid
     long long lo = b * r, hi = lo + r;
     if (b == n_bid) hi = n_kv;
@@ -757,6 +759,7 @@ __dpct_inline__ void qsa_attend_kernel(
 
 // ================= 7. qsa_gate_apply =================
 
+template <typename ACC>
 __dpct_inline__ void qsa_gate_apply_kernel(const float *__restrict__ attn,
                                            const float *__restrict__ q_full,
                                            int n_head, int head_dim,
@@ -767,9 +770,9 @@ __dpct_inline__ void qsa_gate_apply_kernel(const float *__restrict__ attn,
         item_ct1.get_local_id(2);
     if (i >= (long long) n_head * head_dim) return;
     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
-    const double sig = 1.0 / (1.0 + sycl::exp(-g));
-    out[i] = f16_from_f32((float) ((double) attn[i] * sig));
+    const ACC g = (ACC) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+    const ACC sig = (ACC) 1 / ((ACC) 1 + sycl::exp(-g));
+    out[i] = f16_from_f32((float) ((ACC) attn[i] * sig));
 }
 
 inline unsigned grid_for(long long n, int threads) {
@@ -911,22 +914,26 @@ void qsa_index_step(const float* pooled, const float* q_idx, const float* bias, 
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<dpct_kernel_name<class qsa_index_kernel_bb65cd>>(
-                sycl::nd_range<3>(sycl::range(1, 1, (unsigned)max_blocks) *
-                                      sycl::range(1, 1, threads),
-                                  sycl::range(1, 1, threads)),
-                exp_props,
-                [=](sycl::nd_item<3> item_ct1)
-                    [[sycl::reqd_sub_group_size(32)]] {
-                        qsa_index_kernel(pooled, q_idx, bias, (int)s.idx_n_head,
-                                         (int)s.idx_dim, s.idx_block, step,
-                                         cell_scores);
+        const sycl::nd_range<3> rng(sycl::range(1, 1, (unsigned)max_blocks) *
+                                        sycl::range(1, 1, threads),
+                                    sycl::range(1, 1, threads));
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class qsa_index_kernel_bb65cd_f64>>(
+                    rng, exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                        qsa_index_kernel_f64(pooled, q_idx, bias, (int)s.idx_n_head,
+                                             (int)s.idx_dim, s.idx_block, step, cell_scores);
                     });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class qsa_index_kernel_bb65cd_f32>>(
+                    rng, exp_props,
+                    [=](sycl::nd_item<3> item_ct1) [[sycl::reqd_sub_group_size(32)]] {
+                        qsa_index_kernel_f32(pooled, q_idx, bias, (int)s.idx_n_head,
+                                             (int)s.idx_dim, s.idx_block, step, cell_scores);
+                    });
+        }
     }
     check_launch("qsa_index");
     if (stream == nullptr) check_sync("qsa_index");
@@ -1102,6 +1109,38 @@ void kv_append(uint16_t* k_pool, uint16_t* v_pool, const int32_t* page_table, in
     kv_append_step(k_pool, v_pool, page_table, step_upload(pos, -1, s), kcur, vcur, s, stream);
 }
 
+/// The two instantiations of each FP64-bound kernel below (see `strata::fp64_kernels_ok`).  An Arc A-series card
+/// refuses to build ANY kernel containing `double`, so nothing here is optional: without the float one, the whole
+/// indexer - and with it every QSA layer - is unavailable on Alchemist.
+__dpct_inline__ void indexer_key_append_kernel_f64(const float *raw, const int32_t *pos_dev, int pos_base,
+                                                   const float *w_k_norm, float eps, float *tail, float *dead,
+                                                   float *pooled, int32_t *block_pos, int idx_dim, int r,
+                                                   int n_rot, const float *cos_tab, const float *sin_tab,
+                                                   const int32_t *mtab, uint8_t *slm) {
+    indexer_key_append_kernel<double>(raw, pos_dev, pos_base, w_k_norm, eps, tail, dead, pooled, block_pos,
+                                      idx_dim, r, n_rot, cos_tab, sin_tab, mtab, slm);
+}
+__dpct_inline__ void indexer_key_append_kernel_f32(const float *raw, const int32_t *pos_dev, int pos_base,
+                                                   const float *w_k_norm, float eps, float *tail, float *dead,
+                                                   float *pooled, int32_t *block_pos, int idx_dim, int r,
+                                                   int n_rot, const float *cos_tab, const float *sin_tab,
+                                                   const int32_t *mtab, uint8_t *slm) {
+    indexer_key_append_kernel<float>(raw, pos_dev, pos_base, w_k_norm, eps, tail, dead, pooled, block_pos,
+                                     idx_dim, r, n_rot, cos_tab, sin_tab, mtab, slm);
+}
+__dpct_inline__ void qsa_gate_apply_f32_kernel_f64(const float *a, const float *q, int nh, int hd, float *o) {
+    qsa_gate_apply_f32_kernel<double>(a, q, nh, hd, o);
+}
+__dpct_inline__ void qsa_gate_apply_f32_kernel_f32(const float *a, const float *q, int nh, int hd, float *o) {
+    qsa_gate_apply_f32_kernel<float>(a, q, nh, hd, o);
+}
+__dpct_inline__ void qsa_gate_apply_kernel_f64(const float *a, const float *q, int nh, int hd, uint16_t *o) {
+    qsa_gate_apply_kernel<double>(a, q, nh, hd, o);
+}
+__dpct_inline__ void qsa_gate_apply_kernel_f32(const float *a, const float *q, int nh, int hd, uint16_t *o) {
+    qsa_gate_apply_kernel<float>(a, q, nh, hd, o);
+}
+
 void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_base, const float* w_k_norm,
                         float eps, const QsaIndexerBuffers& b, const QsaShapes& s, const float* cos_tab,
                         const float* sin_tab, void* stream) {
@@ -1115,7 +1154,10 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     from the original code. Check that the allocated memory size in the migrated
     code is correct.
     */
-    const size_t smem = (size_t)s.idx_dim * sizeof(double);
+    // The SLM array is `ACC`, so its SIZE depends on which instantiation runs: halving it on Alchemist is not an
+    // optimisation, it is part of the same choice the kernel makes.
+    const bool f64 = strata::fp64_kernels_ok(strata::q_of(stream)->get_device());
+    const size_t smem = (size_t)s.idx_dim * (f64 ? sizeof(double) : sizeof(float));
     // **ONE LAUNCH, NO HOST BRANCH ON THE POSITION.**  The completion rotation is inside the kernel now.  The
     // arguments here are identical for every token, which is the property a CUDA graph needs: this function can
     // be captured and replayed, and the position arrives through `pos_dev` like every other kernel's data.
@@ -1127,35 +1169,49 @@ void indexer_key_append(const float* raw, const int32_t* pos_dev, int32_t pos_ba
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
         strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
             ->submit([&](sycl::handler &cgh) {
                 sycl::local_accessor<uint8_t, 1> dpct_local_acc_ct1(
                     sycl::range(smem), cgh);
 
                 auto mrope_table_ct14 = mrope_table();
-
-                cgh.parallel_for<
-                    dpct_kernel_name<class indexer_key_append_kernel_9e74e0>>(
-                    sycl::nd_range<3>(sycl::range(1, 1, threads),
-                                      sycl::range(1, 1, threads)),
-                    exp_props, [=](sycl::nd_item<3> item_ct1) {
-                        indexer_key_append_kernel(
-                            raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail,
-                            b.dead, b.pooled, b.block_pos, (int)s.idx_dim,
-                            (int)s.idx_block, (int)s.n_rot, cos_tab, sin_tab,
-                            mrope_table_ct14,
-                            dpct_local_acc_ct1
+                auto *slm = dpct_local_acc_ct1
                                 .get_multi_ptr<sycl::access::decorated::no>()
-                                .get());
-                    });
+                                .get();
+                const sycl::nd_range<3> rng(sycl::range(1, 1, threads),
+                                            sycl::range(1, 1, threads));
+                if (f64) {
+                    cgh.parallel_for<dpct_kernel_name<class indexer_key_append_kernel_9e74e0_f64>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            indexer_key_append_kernel_f64(
+                                raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled,
+                                b.block_pos, (int)s.idx_dim, (int)s.idx_block, (int)s.n_rot, cos_tab,
+                                sin_tab, mrope_table_ct14, slm);
+                        });
+                } else {
+                    cgh.parallel_for<dpct_kernel_name<class indexer_key_append_kernel_9e74e0_f32>>(
+                        rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                            indexer_key_append_kernel_f32(
+                                raw, pos_dev, (int)pos_base, w_k_norm, eps, b.tail, b.dead, b.pooled,
+                                b.block_pos, (int)s.idx_dim, (int)s.idx_block, (int)s.n_rot, cos_tab,
+                                sin_tab, mrope_table_ct14, slm);
+                        });
+                }
             });
     }
     check_launch("indexer_key_append");
     if (stream == nullptr) check_sync("indexer_key_append");
+}
+
+__dpct_inline__ void qsa_index_kernel_f64(const float *pooled, const float *q_idx, const float *bias,
+                                          int idx_n_head, int idx_dim, long long r, const int32_t *step,
+                                          float *cell_scores) {
+    qsa_index_kernel<double>(pooled, q_idx, bias, idx_n_head, idx_dim, r, step, cell_scores);
+}
+__dpct_inline__ void qsa_index_kernel_f32(const float *pooled, const float *q_idx, const float *bias,
+                                          int idx_n_head, int idx_dim, long long r, const int32_t *step,
+                                          float *cell_scores) {
+    qsa_index_kernel<float>(pooled, q_idx, bias, idx_n_head, idx_dim, r, step, cell_scores);
 }
 
 void qsa_index(const float* pooled, int64_t n_bid, const float* q_idx, const float* bias, const QsaShapes& s,
@@ -1210,6 +1266,7 @@ void qsa_attend(const float* q, const uint16_t* k_scratch, const uint16_t* v_scr
 
 /// The same multiply as `qsa_gate_apply_kernel` WITHOUT the fp16 round - see the header for why the caller
 /// whose weight is a K-quant needs the f32 form.  Identical arithmetic up to the last step.
+template <typename ACC>
 __dpct_inline__ void qsa_gate_apply_f32_kernel(const float *__restrict__ attn,
                                                const float *__restrict__ q_full,
                                                int n_head, int head_dim,
@@ -1220,9 +1277,9 @@ __dpct_inline__ void qsa_gate_apply_f32_kernel(const float *__restrict__ attn,
         item_ct1.get_local_id(2);
     if (i >= (long long) n_head * head_dim) return;
     const int h = (int) (i / head_dim), d = (int) (i % head_dim);
-    const double g = (double) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
-    const double sig = 1.0 / (1.0 + sycl::exp(-g));
-    out[i] = (float) ((double) attn[i] * sig);
+    const ACC g = (ACC) q_full[((size_t) h * 2 * head_dim) + head_dim + d];   // the SECOND half
+    const ACC sig = (ACC) 1 / ((ACC) 1 + sycl::exp(-g));
+    out[i] = (float) ((ACC) attn[i] * sig);
 }
 
 void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes& s, float* out, void* stream) {
@@ -1231,20 +1288,21 @@ void qsa_gate_apply_f32(const float* attn, const float* q_full, const QsaShapes&
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<
-                dpct_kernel_name<class qsa_gate_apply_f32_kernel_7cff4f>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, 256)) *
-                                      sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    qsa_gate_apply_f32_kernel(attn, q_full, (int)s.n_head,
-                                              (int)s.head_dim, out);
-                });
+        const sycl::nd_range<3> rng(sycl::range(1, 1, grid_for(n, 256)) * sycl::range(1, 1, 256),
+                                    sycl::range(1, 1, 256));
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class qsa_gate_apply_f32_kernel_7cff4f_f64>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        qsa_gate_apply_f32_kernel_f64(attn, q_full, (int)s.n_head, (int)s.head_dim, out);
+                    });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class qsa_gate_apply_f32_kernel_7cff4f_f32>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        qsa_gate_apply_f32_kernel_f32(attn, q_full, (int)s.n_head, (int)s.head_dim, out);
+                    });
+        }
     }
     check_launch("qsa_gate_apply_f32");
     if (stream == nullptr) check_sync("qsa_gate_apply_f32");
@@ -1256,20 +1314,21 @@ void qsa_gate_apply(const float* attn, const float* q_full, const QsaShapes& s, 
     {
         auto exp_props = sycl::ext::oneapi::experimental::properties{
             sycl::ext::oneapi::experimental::use_root_sync};
-        dpct::has_capability_or_fail(
-            strata::q_of(stream)->get_device(),
-            {sycl::aspect::fp64});
-
-        strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
-            ->template parallel_for<
-                dpct_kernel_name<class qsa_gate_apply_kernel_650dec>>(
-                sycl::nd_range<3>(sycl::range(1, 1, grid_for(n, 256)) *
-                                      sycl::range(1, 1, 256),
-                                  sycl::range(1, 1, 256)),
-                exp_props, [=](sycl::nd_item<3> item_ct1) {
-                    qsa_gate_apply_kernel(attn, q_full, (int)s.n_head,
-                                          (int)s.head_dim, out);
-                });
+        const sycl::nd_range<3> rng(sycl::range(1, 1, grid_for(n, 256)) * sycl::range(1, 1, 256),
+                                    sycl::range(1, 1, 256));
+        if (strata::fp64_kernels_ok(strata::q_of(stream)->get_device())) {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class qsa_gate_apply_kernel_650dec_f64>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        qsa_gate_apply_kernel_f64(attn, q_full, (int)s.n_head, (int)s.head_dim, out);
+                    });
+        } else {
+            strata::kprof::kp(strata::q_of(stream), __FILE__, __func__, __LINE__)
+                ->template parallel_for<dpct_kernel_name<class qsa_gate_apply_kernel_650dec_f32>>(
+                    rng, exp_props, [=](sycl::nd_item<3> item_ct1) {
+                        qsa_gate_apply_kernel_f32(attn, q_full, (int)s.n_head, (int)s.head_dim, out);
+                    });
+        }
     }
     check_launch("qsa_gate_apply");
     if (stream == nullptr) check_sync("qsa_gate_apply");
