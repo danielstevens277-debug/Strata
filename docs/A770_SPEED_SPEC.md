@@ -39,9 +39,11 @@ Completion requires:
   `ONEAPI_DEVICE_SELECTOR=level_zero:1`. B580 at `level_zero:0` drives the display
   and is outside this single-A770 benchmark.
 - CPU: Ryzen 5 5600, six cores/twelve threads, AVX2; approximately 31 GiB RAM.
-- A770 is behind the chipset's PCIe 3.0 x4 connection. Engine transfer probes
-  measured 1.7-1.8 GB/s. Do not infer the loaded link from the GPU endpoint's
-  idle sysfs speed alone; record the upstream bridge and the measured transfer.
+- The campaign A770 sits behind the chipset's PCIe 3.0 x4 connection; engine
+  transfer probes there measured 1.7-1.8 GB/s.  The Windows rig is a different
+  card in a different slot and measures 19.4 GB/s pinned (below), so record the
+  upstream bridge *and* the measured transfer - never infer a link from the GPU
+  endpoint's idle sysfs speed alone, in either direction.
 - Build/runtime: oneAPI 2026.1 inside `strata-sycl-dev`.
 
 Measured progress, not estimates:
@@ -52,7 +54,7 @@ Measured progress, not estimates:
 | CPU misses, larger cache and tuned prompt reservation | about 9-11 tok/s | Same context capacity |
 | Fast router plus borrowing and paired mapped transfers | 13.5, 11.9, 12.3 tok/s | 546 input tokens, 128 generated, no prefix reuse |
 | Same final configuration, short warm prompt | 11.4 tok/s | 73 input tokens, 128 generated |
-| A770 16 GB on **Windows** (Level Zero, engine 0.1.56) | not recorded | The doc's kernel findings are the `xe` driver's; on Windows the same card page-locks its resident complement in 2 GiB chunks (36 GiB in 19 chunks, ready in 29 s). Before the chunking default, one 36 GiB `malloc_host` was refused and the complement was pageable, which is why this doc's `--pcie-frac` result was "inert" |
+| A770 16 GB on **Windows** (Level Zero, engine 0.1.56) | **4.0-7.4 tok/s** with the file tier unbuffered, 13.2 tok/s on 2026-11-05 with it warm (the 10.8 GiB that do not fit the RAM mirror cost ~7 s of reads per request: see 'the file tier is worth ~2.5x' below) | 48-layer IQ3_S pack at `--max-context 262144`; resident complement page-locked in 19 x 2 GiB chunks (36 GiB, 29 s), 6.58-6.96 GiB of expert cache; 29-51 tok/s prefill while the file tier is cold, 191-195 warm. The doc's kernel findings are the `xe` driver's, the link findings below are this card's |
 
 The final configuration had 4,717 expert slots, approximately 8.98 GiB in VRAM
 and 15.08 GiB of resident RAM experts. Existing runs did not test a full 128K
@@ -200,8 +202,9 @@ Infernix (`github.com/Wallawalla47/Infernix`, reviewed `main` at the 2026-10
 README/RESEARCH_NOTES) is a CUDA/RTX-5090 engine; its kernels (NVFP4/FP8 MMA,
 `mma.sync`, `cp.async`, TMA, PDL, L2 prefetch) do not port to Intel Arc. Three
 ideas are transferable and go into this round. Its own CPU/PCIe miss-split is
-tuned for PCIe Gen5 x8 (~32 GB/s); the A770 is PCIe 3.0 x4 (~1.8 GB/s, ~18x
-less), so any split must be re-measured here, not copied.
+tuned for PCIe Gen5 x8 (~32 GB/s); the campaign A770 is PCIe 3.0 x4 (~1.8 GB/s,
+~18x less) and this rig's A770 measures 19.4 GB/s pinned (13-14 GB/s on 2 MiB
+expert blobs), so any split must be re-measured here, not copied either way.
 
 1. **Hybrid CPU + PCIe expert-miss split (`--pcie-frac`).** Infernix "computes
    part of each layer's cache misses on the CPU while the rest cross PCIe." We
@@ -249,6 +252,33 @@ VRAM ledger and Windows budget handling, and its 6-CPU-worker finding (we are at
   ~5x slower here because the A770 link is PCIe 3.0 x4 (~1.8 GB/s). The
   Infernix-style hybrid CPU+PCIe split is therefore **not useful on this card** with
   a 1.8 GB/s link. Keep `--pcie-frac 0`.
+  Re-measured 2026-11-05 with the decode timing on: at `pcie_frac 0.6` the
+  per-layer-window line reads **PCIe 5.12 ms** (it reads 0.00 at 0), so the
+  pinned mirror's read path *is* wired - the earlier "counted nothing" was that
+  run's pageable complement.  On the clean pool and cache it changed decode from
+  10.70 to 10.85 tok/s (noise): the path works and does not pay for itself on a
+  1.8 GB/s link.  `0` stays the default because it is slow, not because it is dead.
+  That 1.8 GB/s is the campaign box, not every A770 - but the Windows rig does not
+  reach it either, and the limit there is the card, not the slot.  The A770 sits in the
+  CPU's primary Gen4 x16 slot, and the numbers say so: 512 MiB of pinned host memory
+  copies at **19.4 GB/s** (best of five, warmed), which is above the 15.75 GB/s
+  theoretical of a Gen3 x16 or Gen4 x8 link - the link is x16 Gen4 and the DMA
+  engine uses ~62% of it.  Concurrency does not help: one queue 19.4, two 19.3,
+  three 19.6, four 17.4 GB/s aggregate over the same 512 MiB (per-queue buffers
+  warmed).  A single shared front end, not per-engine saturation - Alchemist
+  memory-subsystem behaviour, as the Chips and Cheese microbenchmarks describe.
+  Expert-sized transfers are worse than that ceiling suggests: 2 MiB blobs run
+  143-150 us each (13-14 GB/s) against 19.4 GB/s for large ones, because every copy
+  pays its own setup.  The CPU pool does the same 2.06 MB IQ3_S expert in ~93 us
+  (58.98 ms over 635 misses in a 119 ms window, an effective 22 GB/s), so the
+  mirror loses by ~1.6x and `--pcie-frac 0` is correct.
+  The last escape hatch is closed as well: a kernel reading `malloc_host` memory
+  directly - which would overlap the fetch with compute and skip the staging copy -
+  fast-fails with 0xC0000409 on this driver/engine build (device and both
+  allocations succeed, the `parallel_for` kills the process), so a DMA copy is the
+  only PCIe path there is.  The engine's own probe reads **13.6 GB/s** and picks
+  `pcie_frac 0.37`; it measures a *pageable* 256 MiB source (pinned only on a layer
+  split), so that number is a floor, not the ceiling on this card.
 - **Item 3, adaptive draft length** — resolved: keep the default 0.5. Steady
   decode in one window cluster (546-token prompt, 256 generated):
   `--spec-min-p 0.0` = 10.4 / 10.5 / 10.4 tok/s (draft acceptance ~52%);
@@ -268,7 +298,7 @@ cheap "overlap" knob.
 
 Exhausted-lever summary (all measured, same-window where it matters): spec window
 width (wider worse), spec-min-p (0.5 best), spec-split (worse), pool-workers
-6/7 (wash), cache size (smaller worse), adapt-swaps 0 (worse), pcie-frac (inert),
+6/7 (wash), cache size (smaller worse), adapt-swaps 0 (worse), pcie-frac (wired, behind the CPU pool),
 GRF 128/256 (no-op/worse), expert-lanes 8/16 (wash), mmvf-rows (worse). No config
 or on/off switch reaches 20 tok/s or even materially past ~12.6.
 
@@ -555,6 +585,83 @@ wait dominates**, i.e. the GPU expert/attention compute for VRAM-resident
 experts, not the BF16 dense projections and not the host handshake. The
 remaining lever toward 20 tok/s is the quantized expert (IQ) GPU kernels and
 the effective token/window count, not the BF16 projection geometry tested here.
+
+### Re-measured 2026-11-05 (engine 0.1.56, this machine): 13.2 tok/s warm, and the two cliffs that cost it
+
+The WebUI template's command line (`--stream-experts --expert-cache auto --spec 2
+--kv int8 --pool-workers 5 --pool-affinity p-cores --prefill auto
+--vram-reserve-mib 1024 --pcie-frac 0`), driven through the server's
+`sampling.strata_tune` so the tunables needed no restart:
+
+| | |
+| --- | --- |
+| expert cache, clean card | 3518 slots / 6.74 GiB (9.44 GiB of 15.9 GiB free after the weights) |
+| decode, warm (3rd/4th request) | 12.2, **13.2 tok/s**; the 1st request after load: 9.0 |
+| prefill | 191-195 tok/s on a 1k prompt (235-token prompts: 17-18 tok/s, fixed overhead) |
+| window (62 windows) | 119.34 ms = verify 109.51 (GPU-reach 49.35 + per-layer host 44.44 [CPU 29.45] + stage 0.06) + draft 7.69; 1.58 tokens/window |
+| per layer-window | CPU experts 7.40 ms (8.17 entries), VRAM hits 9.57, PCIe 0.00 |
+
+So the split is **GPU ~41%, CPU pool ~25%, draft ~6%**: the CPU share moves with
+the cache size (8.98 GiB: 25 of 174 ms; 6.74 GiB: 29 of 119), exactly as the
+rebalance table above says.
+
+Two ways to lose half of it, both silent in 0.1.56 and both warnings now:
+
+- **Another process holding the card.** The same command, started while 6.4 GiB
+  of VRAM was still held by a previous engine, opened 476 slots (0.93 GiB) and
+  ran 3.5 tok/s: `strata generate: WARNING: ... GiB of VRAM is free after the
+  weights: another process holds the rest`.  The test is the free share at the
+  cache decision: 9.44 GiB healthy, 3.04 GiB starved, warning under 45%.
+- **An E-core worker.** `--pool-workers 10 --pool-affinity all` on the 6P/8E
+  host (8 of the 10 on E-cores) gave 5.0 / 5.2 tok/s where 5 workers on the
+  P-cores gave 10.7-13.2: the pool's barrier waits for the slowest expert row of
+  every layer.  `WARNING: N pool workers but only M on the P-cores: the extra
+  ones land on E-cores ...`.
+
+`--vram-reserve-mib 384 --prefill 1024` instead of 1024/auto leaves 400-600 more
+slots (3787-4141, 7.25-7.92 GiB) for about +1% decode: keep the default unless
+the prompt path needs the reserve.  A cold start is the third kind of loss and
+is inherent: the first request after load ran 9.0 tok/s with 46.8 tok/s prefill
+and a 27 ms draft against 13.2 / 195 / 7.7 warm, so measure warm.
+
+### Re-measured 2026-11-06: the file tier is worth ~2.5x, and it is the drive
+
+Same box, same pack, one 679-token prompt, 256 generated, engine built from this
+revision, `STRATA_DECODE_TIMING=1`:
+
+| config | window | of which `jobs` (cold file reads) | decode |
+| --- | --- | --- | --- |
+| `--resident-budget-gib 36`, template line | 212-377 ms | 45.3 / 121.9 ms | 4.0-4.9 tok/s |
+| `--resident-budget-gib 20` | 363-423 ms | 134.8 / 153.1 ms | 2.7 tok/s |
+| the WebUI json (36 GiB, 262144 context, conversation cache) | - | - | 4.6-5.7 tok/s |
+
+Per layer-window the CPU pool (6.5-6.6 ms over 7.3-7.6 entries) and the VRAM hits
+(12.4-12.7 ms) do not move between the three runs: everything that separates them
+sits in `ms_jobs`, the section that holds `wait_landed` for the file tier. And the
+file tier is sized by the budget - 36 GiB leaves **10.8 GiB of experts read from
+the files**, 20 GiB leaves **26.8 GiB** - against a drive measured independently at
+**1.46-1.53 GB/s** (512 MiB cold reads at three offsets of the 70.4 GB GGUF, same
+1.5 GB/s the engine's own profile fill reports). The engine says the rest itself:
+`5851 blob reads from the file` per request and `the file cache cannot keep them`.
+
+So the 2026-11-05 row above (12.2-13.2 tok/s, `jobs` 8.79 ms) is not contradicted
+by today's 4-5: it was taken with the file tier warm or absent. 47 GiB of experts
+do not fit beside a 36 GiB mirror on 64 GiB, so the 10.8 GiB that miss are read
+from a 1.5 GB/s drive *unbuffered* - on purpose, so a repeat request does not get
+them back from the OS cache - and that is ~7 s of reads per request, which is the
+whole difference.
+
+Consequences, in order:
+
+- **Keep `--resident-budget-gib 36` on this box.** `20` more than doubles the read
+  set (26.8 GiB) and takes decode from ~4.5 to 2.7 tok/s. The server's own
+  `budget > free or > total - 6` warning does not fire at 36 because 36 fits; what
+  does not fit is the *remainder* of the expert set.
+- **The next real lever on a 64 GiB box is not a kernel**: a bigger RAM mirror, a
+  drive that reads 10.8 GiB in less than 7 s, or an expert quantisation small
+  enough that the whole set fits in RAM.
+- **Do not read 13 tok/s as today's rate on this PC.** The start-up line
+  `N GiB of experts read from the files` predicts the request; measure warm.
 
 ### End-to-end confirmation (this revision, unprofiled)
 

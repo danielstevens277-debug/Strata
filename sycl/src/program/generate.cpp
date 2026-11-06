@@ -4747,6 +4747,19 @@ int main(int argc, char **argv) try {
                      strata::kernels::cpu::host_core_setting() == strata::kernels::cpu::HostCore::Last ? "last" : "first");
         // the same facts in plain words, and whether each worker has a physical core of its own
         std::fprintf(stderr, "strata generate: %s\n", pool.placement_line().c_str());
+        // A worker on an E-core straggles every layer.  The pool's barrier waits for the slowest expert row of the
+        // layer, so one slow worker costs the whole verify window: measured on the A770's 6P/8E host, --pool-workers 10
+        // --pool-affinity all (8 of the 10 on E-cores) gave 5.0 and 5.2 tok/s where 5 workers on the P-cores gave 10.7,
+        // same cache, same prompt.  Nothing in the placement line says the extra workers are the slow kind.
+        // (All places a worker per PHYSICAL core in OS order, so the P-cores run out at p_cores(); Auto fills the
+        // P-cores' threads first, so its limit is p_threads().  The pool knows both; ht (a second detection for the
+        // placement print above) does not report the hybrid counts under All.)
+        const int p_limit = pool.affinity() == strata::kernels::cpu::PoolAffinity::All ? pool.p_cores() : pool.p_threads();
+        if (pool.is_hybrid() && pool.affinity() != strata::kernels::cpu::PoolAffinity::PCores && pool.workers() > p_limit)
+            std::fprintf(stderr, "strata generate: WARNING: %d pool workers but only %d on the P-cores: the extra ones land "
+                                 "on E-cores and every layer waits for them (measured 5.0 vs 10.7 tok/s on a 6P/8E host). "
+                                 "Keep the workers on the P-cores with --pool-affinity p-cores, or lower --pool-workers to "
+                                 "%d.\n", pool.workers(), p_limit, p_limit);
     }
     if (o.no_ple_prefetch) strata::kernels::ple_prefetch_enable(false);
     // ---- R4's slot storage.  Allocated AFTER the weights and the session, so `cudaMemGetInfo` inside `open`
@@ -4779,7 +4792,20 @@ int main(int argc, char **argv) try {
     };
     if (o.expert_cache < 0) {
         size_t free_b = 0, total_b = 0;
-        free_b = strata::core::device_free_bytes(); (void) total_b;
+        free_b = strata::core::device_free_bytes();
+        total_b = strata::core::device_total_bytes();
+        // A card whose memory another process holds hands the cache what is left, and says nothing: on an Arc A770 the
+        // same command then opened 476 slots (0.93 GiB) instead of 3415 (6.54 GiB) and ran 3.5 tok/s instead of 10.7,
+        // with a smaller cache as the only visible symptom.  The weights are loaded by now (~5.6 GiB of a 16 GiB card),
+        // so under 45% free means somebody else is on the card (a healthy 16 GiB run sits near 9.3 GiB, the starved one
+        // at 3.0).  #1545's UMA case is excluded upstream (0 total).
+        if (total_b > 0 && (double) free_b < 0.45 * (double) total_b)
+            std::fprintf(stderr, "strata generate: WARNING: %.2f of %.2f GiB of VRAM is free after the weights: another "
+                                 "process holds the rest (a previous engine, a browser, the desktop). The expert cache "
+                                 "takes what is left, so it is far smaller than the card allows - measured: 0.93 GiB "
+                                 "(476 slots, 3.5 tok/s) against 6.54 GiB (3415 slots, 10.7 tok/s) for the same command. "
+                                 "Close that process and start again.\n",
+                         (double) free_b / 1073741824.0, (double) total_b / 1073741824.0);
         // Plan v0.3 P5: the batched prompt path's chunk buffers are allocated later, so they are reserved here -
         // under WDDM an over-subscribed allocation does not fail, it pages to system memory and crawls.
         // (with borrowing - the default with a profile - the prompt path lends cache slots instead; `pf_borrow` is

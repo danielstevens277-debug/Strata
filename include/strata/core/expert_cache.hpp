@@ -79,6 +79,10 @@ bool write_expert_profile(const std::string& path, int64_t n_layers, int64_t n_e
 /// card STRATA_VRAM_FREE=device (opt-in) takes the smaller of that and NVML's figure for the whole card: under WDDM
 /// cudaMemGetInfo does not count what other processes hold.  It can only make the figure smaller.
 size_t device_free_bytes();
+/// The card's total device memory - what a start that finds itself short has to compare against (0: unknown, a unified
+/// memory system, or a driver that does not say).  device_free_bytes() alone cannot tell a small card from a card whose
+/// memory another process holds.
+size_t device_total_bytes();
 
 /// One piece of an expert blob that lives contiguously in a source's own memory: `n` bytes at `p`, to land `at` bytes into the blob.
 struct BlobPart { const uint8_t* p; uint64_t n; uint64_t at; };

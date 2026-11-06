@@ -66,6 +66,23 @@ static unsigned long long own_drm_local_bytes() {
 // See the header.  NVIDIA's DGX Spark Porting Guide (section 5.5, "Memory reporting on UMA systems") recommends the same:
 // not to rely on cudaMemGetInfo alone but to count the memory the OS can reclaim.  Swap is not counted here (unlike
 // NVIDIA's reference snippet): an expert cache that pushes the system into swap would be far slower than a smaller one.
+// The same query, the total only.  A unified memory system gets 0: there "the card" is the system's RAM and a free
+// figure below half of it says nothing about another process.
+size_t device_total_bytes() try {
+    size_t free_b = 0, total_b = 0;
+    dpct::get_current_device().get_memory_info(free_b, total_b);
+    (void) free_b;
+#if defined(__linux__) && !defined(STRATA_HIP_GFX906)
+    int dev = 0, v = 0;
+    if (DPCT_CHECK_ERROR(dev = dpct::get_current_device_id()) == 0 && dev >= 0 &&
+        DPCT_CHECK_ERROR(v = dpct::get_device(dev).get_integrated()) == 0 && v)
+        return 0;
+#endif
+    return total_b;
+} catch (...) {
+    return 0;
+}
+
 size_t device_free_bytes() try {
     size_t free_b = 0, total_b = 0;
     /*
