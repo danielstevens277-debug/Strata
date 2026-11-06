@@ -1251,13 +1251,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   add_executable(iq_parity src/kernels/iq_parity.cpp)
   target_include_directories(iq_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(iq_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})
-  # TODO 24: the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 + numpy
-  # and the repository's vendored gguf-py (no pip installs); it writes deterministic fixtures into the
-  # BUILD directory (the source tree is not touched).  The CTest fixture makes generation-to-test order
-  # explicit even under parallel execution; a fixture-generation failure fails iq_parity with it.
+  # TODO 24: the i-quant fixtures are generated, not shipped.  tools/iq_fixture.py needs python3 with numpy
+  # AND PyYAML - the repository's vendored gguf-py imports yaml unconditionally, so numpy alone makes the
+  # generator exit 3 and the test silently skip; it writes deterministic fixtures into the BUILD directory
+  # (the source tree is not touched).  The CTest fixture makes generation-to-test order explicit even under
+  # parallel execution; a fixture-generation failure fails iq_parity with it.
   find_package(Python3 COMPONENTS Interpreter QUIET)
-  # the generator needs an interpreter WITH numpy: probe the configured one, the setup's .venv, and the
-  # system python3; -DIQ_FIXTURE_PYTHON=... overrides the search outright.
+  # the generator needs an interpreter with numpy AND PyYAML: probe the configured one, the setup's .venv,
+  # and the system python3; -DIQ_FIXTURE_PYTHON=... overrides the search outright.
   set(_iq_python "")
   set(_iq_candidates "")
   if(IQ_FIXTURE_PYTHON)
@@ -1275,10 +1276,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     if(_cand STREQUAL "")
       continue()
     endif()
-    execute_process(COMMAND ${_cand} -c "import numpy" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _iq_probe)
+    # BOTH modules, not just numpy: the vendored gguf-py imports it unconditionally (gguf/metadata.py ->
+    # `import yaml`), so a probe that passes on numpy alone picks an interpreter whose fixture run exits 3 and
+    # the test shows up as "Skipped" with nothing saying why.
+    execute_process(COMMAND ${_cand} -c "import numpy, yaml"
+                    OUTPUT_QUIET ERROR_VARIABLE _iq_probe_err RESULT_VARIABLE _iq_probe)
     if(_iq_probe EQUAL 0)
       set(_iq_python "${_cand}")
       break()
+    endif()
+    string(STRIP "${_iq_probe_err}" _iq_probe_err)
+    if(_iq_probe_err MATCHES "No module named '([a-zA-Z0-9_]+)'")
+      string(APPEND _iq_probe_why " [${_cand}: ${CMAKE_MATCH_1} missing]")
+    else()
+      string(APPEND _iq_probe_why " [${_cand}: probe failed]")
     endif()
   endforeach()
   if(NOT _iq_python STREQUAL "")
@@ -1290,9 +1301,10 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
     set_tests_properties(iq_parity PROPERTIES FIXTURES_REQUIRED iq_fixture_data SKIP_RETURN_CODE 3)
   else()
-    message(STATUS "STRATA tests: no python3 with numpy was found (the configured interpreter and .venv "
-                   "were probed) - the iq_parity fixtures and its test are not registered; the fixtures "
-                   "need python3 with numpy and the repository's vendored gguf-py")
+    message(STATUS "STRATA tests: no interpreter with numpy and PyYAML was found (the configured Python3 and "
+                   ".venv were probed;${_iq_probe_why}) - the iq_parity fixtures and its test are not "
+                   "registered.  PyYAML is needed because the vendored gguf-py imports it; -DIQ_FIXTURE_PYTHON="
+                   "<python> names an interpreter outright")
   endif()
   if(STRATA_ENABLE_CUDA)
     # native_mmvq's multi_exact contract, bitwise: a T-column call against T single-column calls on the same Q8_1

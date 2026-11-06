@@ -506,7 +506,8 @@ on the same card. Logprobs for "Paris" (IQ2_XS) -0.0019 (p 0.998).
 
 **Tests (0.1.x ports).** On the B70, 19 of the 22 kernel parity tests passed byte for byte or within tolerance; the others needed
 model fixtures or the tensor-core kernel. Parity gaps that remain: `s2_expert_grouped_parity` (the s2 path), `kv_hybrid_parity`'s
-last step on the XMX kernel, `ple_parity` and `native_expert_parity` need model files.
+last step on the XMX kernel, `ple_parity` (any GGUF holding the PLE table - it is found by tensor name, so a folder or any shard works - plus the
+`pack/full` and `bench/micro` dev fixtures, without which it is not registered) and `native_expert_parity` need model files.
 
 **Fixed bugs worth knowing if you see the symptom** (fixed long ago; the symptom is listed so a search finds this line). `--stream-experts` read
 the wrong shard for layers past a shard boundary (NaN logits from layer 13 on, Swift 1.5). IQ2_XS products were garbage because of

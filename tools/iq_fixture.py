@@ -38,12 +38,18 @@ try:
     import gguf
     from gguf.quants import dequantize as gguf_dequantize
     from gguf_writer import dequantize_q2_0, quantize_q2_0
-except ImportError as e:  # a missing numpy or vendored gguf-py must be explicit, not a traceback
+except ImportError as e:  # a missing numpy/yaml or vendored gguf-py must be explicit, not a traceback
+    _name = e.name or ""
+    _fix = {
+        "numpy": "  install numpy into this interpreter (pip install numpy)",
+        "yaml": "  install PyYAML (pip install pyyaml): the vendored gguf-py imports it unconditionally "
+                "(gguf/metadata.py), so numpy alone is not enough",
+    }.get(_name, "  the repository's vendored gguf-py comes with setup's llama.cpp download (the pinned "
+                 "LLAMA_CPP_COMMIT zip); on a fresh checkout run setup once, or fetch that zip and unpack "
+                 "its gguf-py into third_party/llama.cpp")
     sys.stderr.write(f"iq_fixture: missing dependency: {e}\n"
-                     "numpy and the repository's vendored gguf-py (third_party/llama.cpp/gguf-py) are "
-                     "required.  The vendored copy comes with setup's llama.cpp download (the pinned "
-                     "LLAMA_CPP_COMMIT zip); on a fresh checkout run setup once, or fetch that zip and "
-                     "unpack its gguf-py there.\n")
+                     f"interpreter: {sys.executable}\n"
+                     f"to fix:{_fix}\n")
     sys.exit(3)
 
 QT = gguf.GGMLQuantizationType

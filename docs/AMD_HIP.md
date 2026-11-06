@@ -392,7 +392,8 @@ The RX 9070 / 9070 XT and the Radeon AI PRO R9700 run the same kernels as gfx110
 signed dot4 instruction and a 100 MHz wall clock. Switch defaults for gfx12 are in [Speed switches](#speed-switches).
 
 - **Build and tests:** `-DCMAKE_HIP_ARCHITECTURES=gfx1201 -DSTRATA_BUILD_TESTS=ON -DSTRATA_PREFILL_MMQ=ON`. On an R9700,
-  `ple_parity` (needs the Q2_0 fixture) and `expert_multi_test` (needs AVX-512) fail for reasons outside the GPU.
+  `ple_parity` (needs the dev pack and capture, and any GGUF that holds the PLE table - without the first two it is not
+  registered, by design) and `expert_multi_test` (needs AVX-512) fail for reasons outside the GPU.
 - **Architecture check:** a gfx1100-only build stops on a gfx1201 card at startup with a plain message.
 - **hipBLASLt:** the gfx120X wheel's hipBLASLt is 1.2.0 and no table ships for it, so Linux `rx9070` uses plain hipBLAS. A
   table calibrated for it measured within noise end to end. Tables for 1.2.2 (system ROCm 7.2.4), 1.4.1 and 1.5.0 exist in

@@ -373,10 +373,20 @@ if(STRATA_SYCL_PARITY)
     if(_cand STREQUAL "")
       continue()
     endif()
-    execute_process(COMMAND ${_cand} -c "import numpy" OUTPUT_QUIET ERROR_QUIET RESULT_VARIABLE _iq_probe)
+    # BOTH modules, not just numpy: the vendored gguf-py imports it unconditionally (gguf/metadata.py ->
+    # `import yaml`), so a probe that passes on numpy alone picks an interpreter whose fixture run exits 3 and
+    # the test shows up as "Skipped" with nothing saying why.
+    execute_process(COMMAND ${_cand} -c "import numpy, yaml"
+                    OUTPUT_QUIET ERROR_VARIABLE _iq_probe_err RESULT_VARIABLE _iq_probe)
     if(_iq_probe EQUAL 0)
       set(_iq_python "${_cand}")
       break()
+    endif()
+    string(STRIP "${_iq_probe_err}" _iq_probe_err)
+    if(_iq_probe_err MATCHES "No module named '([a-zA-Z0-9_]+)'")
+      string(APPEND _iq_probe_why " [${_cand}: ${CMAKE_MATCH_1} missing]")
+    else()
+      string(APPEND _iq_probe_why " [${_cand}: probe failed]")
     endif()
   endforeach()
   if(NOT _iq_python STREQUAL "")
@@ -386,7 +396,10 @@ if(STRATA_SYCL_PARITY)
     add_test(NAME iq_parity COMMAND iq_parity ${CMAKE_CURRENT_BINARY_DIR}/iq_fixture)
     set_tests_properties(iq_parity PROPERTIES FIXTURES_REQUIRED iq_fixture_data SKIP_RETURN_CODE 3)
   else()
-    message(STATUS "STRATA SYCL tests: no python3 with numpy found - iq_parity and its fixtures are not registered")
+    message(STATUS "STRATA SYCL tests: no interpreter with numpy and PyYAML was found (the configured Python3 "
+                   "and .venv were probed;${_iq_probe_why}) - iq_parity and its fixtures are not registered.  "
+                   "PyYAML is needed because the vendored gguf-py imports it; -DIQ_FIXTURE_PYTHON=<python> "
+                   "names an interpreter outright")
   endif()
   # ple: real inputs (the GGUF that holds the PLE table, the dense pack, the ggml capture).  The shard is found by
   # tensor name, so -DSTRATA_PLE_GGUF takes a folder, any shard of the set or the shard itself, and $STRATA_PLE_GGUF
