@@ -1665,10 +1665,12 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and
   # splitting them across two libraries would only add a layer.
   #
-  # The pack, the original GGUF and the ggml capture are all REQUIRED inputs: this test's oracles are real
-  # artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
+  # The pack, the GGUF that holds the PLE table and the ggml capture are all REQUIRED inputs: this test's oracles are
+  # real artifacts, so the working directory is pinned to the source tree and a missing input is a hard error
   # INSIDE the test.  A test that passes by finding nothing to compare is the failure mode this project keeps
-  # re-learning.
+  # re-learning.  WHICH shard holds the table is not assumed: --gguf takes the folder, any shard of the set or the
+  # shard itself, and the file with `per_layer_token_embd.weight` is the one read (shard 2 of the original shard
+  # alone; shard 1 of Swift 1.5 holds layers 0-12 and the table).
   add_executable(ple_parity src/kernels/ple_parity.cpp)
   target_include_directories(ple_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(ple_parity PRIVATE strata_kernels ${_strata_gpu_runtime_target})

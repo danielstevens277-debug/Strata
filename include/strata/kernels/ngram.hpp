@@ -210,6 +210,12 @@ public:
     /// conversation cache no room (#4518).
     bool unlock();
     uint64_t rows() const;
+    /// Bytes of one row in the file: the reader's row stride (90 for IQ4_NL, 170 for Q8_0, ...).  A test
+    /// that reads rows of its own has to use this rather than assume the original artifact's IQ4_NL width.
+    uint64_t row_bytes() const;
+    /// The file offset of row 0: the GGUF data section's start plus the tensor's offset.  Not 0 and not a
+    /// constant: a shard that also holds layers (Swift 1.5's shard 1) puts the table further in.
+    uint64_t data_offset() const;
     /// Bytes of the whole table (rows x row bytes) while open; 0 when closed.  The residency policy in
     /// generate.cpp sizes the table with this before it decides to keep it in RAM.
     uint64_t table_bytes() const;

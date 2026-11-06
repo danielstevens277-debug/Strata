@@ -389,13 +389,16 @@ bool PleTable::open(const std::string& gguf_path, std::string& err, const PleIoO
         return false;
     }
     impl_->data = impl_->file->tensor_data(*t);        // only a table that fits the file is mapped
+    // The offset of row 0, kept for both modes: `data_offset()` is what a caller that reads the file itself
+    // (a test comparing rows against numpy) needs, and it is not a constant - a shard that also holds layers
+    // puts the table further into the file.
+    impl_->table_offset = impl_->file->data_start() + t->offset;
     if (io.mode == PleIo::Direct) {
         // The parse above is the validated source of the offset; the mapping itself is not kept, so no page of
         // the table can enter this process's working set or the file cache through it.
-        const uint64_t table_offset = impl_->file->data_start() + t->offset;
+        const uint64_t table_offset = impl_->table_offset;   // set above, before the branch
         const uint64_t n_rows = impl_->n_rows;
         impl_->path = gguf_path;
-        impl_->table_offset = table_offset;
         delete impl_->file;
         impl_->file = nullptr;
         impl_->data = nullptr;
@@ -533,6 +536,7 @@ void PleTable::close() {
     impl_->file = nullptr;
     impl_->data = nullptr;
     impl_->n_rows = 0;
+    impl_->table_offset = 0;
     impl_->rb = PLE_ROW_BYTES;
     impl_->fmt = &ple_format_info(PleFormat::IQ4_NL);
     impl_->scale = 1.0f;
@@ -551,6 +555,8 @@ bool PleTable::unlock() {
 const char* PleTable::format() const { return impl_->fmt->name; }
 PleIo PleTable::mode() const { return impl_->mode; }
 uint64_t PleTable::rows() const { return impl_->n_rows; }
+uint64_t PleTable::row_bytes() const { return impl_->rb; }
+uint64_t PleTable::data_offset() const { return impl_->table_offset; }
 uint64_t PleTable::table_bytes() const { return impl_->n_rows * (uint64_t) impl_->rb; }
 uint64_t PleTable::bytes_read() const { return impl_->bytes_read; }
 

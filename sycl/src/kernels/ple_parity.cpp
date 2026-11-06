@@ -5,7 +5,10 @@
 //   A. THE HASH against `ref/ngram.py::ngram_rows`, via `ple_oracle_vectors.inc` (generated).  The properties
 //      are asserted OBSERVABLE first - XOR vs sum, `%` vs `&`, the cut DIRECTION, the NULL sentinel - because
 //      each rival reading produces a perfectly valid index in range.
-//   B. THE TABLE against numpy reading the ORIGINAL GGUF at the offset the validated `gguf_reader` reports.
+//   B. THE TABLE against numpy reading the ORIGINAL GGUF at the offset the validated `gguf_reader` reports.  The
+//      GGUF is LOCATED by tensor name (`per_layer_token_embd.weight`), so shard 2 of the original, shard 1 of a
+//      Swift 1.5 file, or a folder holding either all work; the baked numpy rows are the original's, so the row
+//      comparisons run when the file is that artifact and a format-agnostic set runs on any other table.
 //   C. THE BLOCK against ggml's own graph, captured in `bench/micro/ple_in.bin` / `ple_out.bin` by
 //      `ple_layer_xcheck.cpp`.  That file records EVERY intermediate (key, value, gate, gated, normalized,
 //      conv_out, result), so a mismatch can be attributed to a stage instead of guessed at - and the weights
@@ -17,13 +20,16 @@
 #include "strata/kernels/ngram.hpp"
 #include "strata/kernels/f16_bits.hpp"
 #include "strata/kernels/native_mmvq.hpp"
+#include "strata/artifact/gguf_reader.hpp"   // the shard scan: tensor names, header only
 #include "ple_oracle_vectors.inc"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 #include <string>
 #include <stdexcept>
 #include <vector>
@@ -108,13 +114,6 @@ std::vector<uint8_t> read_at(const char* path, long long off, size_t n) {
     std::fclose(f);
     if (got != n) return {};
     return v;
-}
-
-/// Only used for the pack, which is 5.4 GB rather than 28.8 GB - and even then the caller says which region.
-std::vector<uint8_t> read_path(const char* path) {
-    const long long n = file_size(path);
-    if (n <= 0) return {};
-    return read_at(path, 0, (size_t) n);
 }
 
 /// Dequantize one IQ4_NL row with an INTERLEAVED nibble order, to show the correct split-half order is
@@ -298,13 +297,75 @@ int history_advance_regression() {
 
 }  // namespace
 
+// ---- WHICH FILE HOLDS THE TABLE ------------------------------------------------------------
+// The PLE table is not always in the last shard, and not always alone in its shard: the original's
+// shard 2 holds it by itself, Swift 1.5's shard 1 holds layers 0-12 and the table.  setup.py and
+// generate.cpp both find it by tensor name rather than by position, so the test does too: --gguf may
+// name the folder, any shard of the set, or the shard itself, and the file that has
+// `per_layer_token_embd.weight` is the one read.
+static const char* const kPleTensor = "per_layer_token_embd.weight";
+
+/// Header only (the tensor infos): a 70 GB shard is never read past its header here.
+static bool has_ple_table(const std::string& path) {
+    try {
+        strata::GgufFile f(path);
+        return f.find(kPleTensor) != nullptr;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+static std::string file_name(const std::string& path) {
+    return std::filesystem::path(path).filename().string();
+}
+
+/// The shared part of a `-NNNNN-of-MMMMM.gguf` name, so the folder scan tries the rest of THIS set
+/// before anything else in the folder; "" when the name is not a shard name.
+static std::string shard_stem(const std::string& path) {
+    const std::string name = file_name(path);
+    const std::size_t dash = name.rfind('-');
+    if (dash == std::string::npos) return std::string();
+    const std::size_t of = name.find("-of-", dash);
+    if (of == std::string::npos || of == dash + 1) return std::string();
+    for (std::size_t i = dash + 1; i < of; ++i)
+        if (!std::isdigit((unsigned char) name[i])) return std::string();
+    return name.substr(0, dash);
+}
+
+/// The file to read the table from; `note` says where it was found when that is not `asked`.
+static std::string locate_ple_gguf(const std::string& asked, std::string& note) {
+    std::error_code ec;
+    std::vector<std::string> files;
+    const bool is_dir = std::filesystem::is_directory(asked, ec);
+    const std::string dir = is_dir ? asked : std::filesystem::path(asked).parent_path().string();
+    const std::string stem = is_dir ? std::string() : shard_stem(asked);
+    if (!is_dir && has_ple_table(asked)) return asked;          // the shard that carries it: no scan
+    std::vector<std::string> same, other;
+    for (std::filesystem::directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec)) {
+        const std::string f = it->path().string();
+        if (it->path().extension() != ".gguf" || f == asked) continue;
+        ((is_dir || (!stem.empty() && shard_stem(f) == stem)) ? same : other).push_back(f);
+    }
+    std::sort(same.begin(), same.end());
+    std::sort(other.begin(), other.end());
+    for (const std::vector<std::string>* group : {&same, &other})
+        for (const std::string& f : *group)
+            if (has_ple_table(f)) {
+                note = is_dir ? ("the PLE table is in " + file_name(f))
+                              : ("the PLE table is not in " + file_name(asked) + " but in " + file_name(f) +
+                                 ": reading it from there");
+                return f;
+            }
+    return asked;   // nothing found: PleTable::open says what is missing from `asked`
+}
+
 int main(int argc, char** argv) {
     bool selftest = false;
     bool check_fixtures = false;
     std::string pack = "pack/full";
-    // --gguf, else $STRATA_PLE_GGUF, else the development layout (run from the engine root)
-    std::string gguf = std::getenv("STRATA_PLE_GGUF") ? std::getenv("STRATA_PLE_GGUF")
-                                                      : "../../Q2_0/Qwen3.8-Flash-Next-GSQ-RCO-Q2_0-00002-of-00002.gguf";
+    // --gguf, else $STRATA_PLE_GGUF, else the development layout (run from the engine root).  A folder, any shard
+    // of a shard set, or the table's own shard all work: locate_ple_gguf finds the file that carries the tensor.
+    std::string gguf = std::getenv("STRATA_PLE_GGUF") ? std::getenv("STRATA_PLE_GGUF") : "../../Q2_0";
     std::string in_bin = "bench/micro/ple_in.bin", out_bin = "bench/micro/ple_out.bin";
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -314,7 +375,8 @@ int main(int argc, char** argv) {
         else if (a == "--gguf" && i + 1 < argc) gguf = argv[++i];
         else if (a == "--in" && i + 1 < argc) in_bin = argv[++i];
         else if (a == "--out" && i + 1 < argc) out_bin = argv[++i];
-        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--pack D] [--gguf F] [--in F] [--out F]\n");
+        else { std::fprintf(stderr, "usage: ple_parity [--selftest] [--check-fixtures] [--pack D] [--gguf F|DIR] [--in F] [--out F]\n"
+                                    "       (F|DIR: the PLE table's shard, any shard of its set, or the folder)\n");
                return 2; }
     }
     if (selftest && check_fixtures) {
@@ -327,28 +389,50 @@ int main(int argc, char** argv) {
     std::string err;
     PleCapture cap;
     bool preflight_done = false;
+    std::string block_missing;   // part C's inputs (the pack, the capture): reported after part B, not before it
     if (selftest || check_fixtures) {
-        if (!table.open(gguf, err) || table.rows() != o::kTableRows ||
-            file_size(gguf.c_str()) != (long long) o::kTableDataStart + (long long) o::kTableRows * k::PLE_ROW_BYTES) {
-            std::fprintf(stderr, "ple_parity: required PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(), err.c_str());
+        // The table is LOCATED before it is judged (a PC whose model keeps it in shard 1 must not look like a broken
+        // table), and its geometry comes from the file itself - the row count, the format's row width, the tensor's
+        // offset - not from the original artifact's constants.
+        std::string where;
+        const std::string asked = gguf;
+        gguf = locate_ple_gguf(asked, where);
+        if (!where.empty()) std::printf("ple_parity: %s\n", where.c_str());
+        // The TABLE is part B's input: fatal when it is missing or does not fit, because part B is the check that
+        // would otherwise be skipped silently.
+        if (!table.open(gguf, err)) {
+            std::fprintf(stderr, "ple_parity: the PLE table is missing or incompatible: %s (%s)\n", gguf.c_str(), err.c_str());
             return 2;
         }
+        {
+            const uint64_t rb = table.row_bytes(), rows = table.rows(), at = table.data_offset();
+            const long long sz = file_size(gguf.c_str());
+            if (rb == 0 || rows > (UINT64_MAX - at) / rb || (unsigned long long) sz < at + rows * rb) {
+                std::fprintf(stderr, "ple_parity: the table does not fit %s: %llu rows x %llu B at %llu in %lld B\n",
+                             gguf.c_str(), (unsigned long long) rows, (unsigned long long) rb,
+                             (unsigned long long) at, sz);
+                return 2;
+            }
+        }
+        // The PACK and the ggml capture are part C's inputs.  They are reported after A and B instead of before them:
+        // the table's own checks do not need them, and a PC that has the model but not the development pack should
+        // still learn whether its table is read correctly.
         const uint64_t pack_needed = std::max({o::kKeyCodesOffset + o::kKeyCodesBytes,
             o::kKeyScalesOffset + o::kKeyScalesBytes, o::kValueOffset + o::kValueBytes});
         const long long pack_size = file_size((pack + "/dense.bin").c_str());
-        if (pack_size < 0 || (uint64_t) pack_size < pack_needed) {
-            std::fprintf(stderr, "ple_parity: required dense pack is missing or truncated: %s/dense.bin\n", pack.c_str());
-            return 2;
-        }
-        if (!load_capture(in_bin.c_str(), out_bin.c_str(), cap)) {
-            std::fprintf(stderr, "ple_parity: required block fixtures are missing, truncated or incompatible: %s / %s\n", in_bin.c_str(), out_bin.c_str());
-            return 2;
-        }
-        preflight_done = true;
+        if (pack_size < 0 || (uint64_t) pack_size < pack_needed)
+            block_missing += "  the dense pack: " + pack + "/dense.bin\n";
+        if (!load_capture(in_bin.c_str(), out_bin.c_str(), cap))
+            block_missing += "  the block fixtures: " + in_bin + " / " + out_bin + "\n";
         if (check_fixtures) {
+            if (!block_missing.empty()) {
+                std::fprintf(stderr, "ple_parity: required inputs are missing or incompatible:\n%s", block_missing.c_str());
+                return 2;
+            }
             std::puts("PASS required PLE fixture structure on CPU; no GPU numerical checks were run");
             return 0;
         }
+        preflight_done = true;
         if (!k::ple_block_available()) {
             std::fprintf(stderr, "ple_parity: --selftest requires a CUDA device for block checks\n");
             return 2;
@@ -501,41 +585,78 @@ int main(int argc, char** argv) {
     }
 
     // ============================ B. THE TABLE ============================
-    std::printf("\nB. the IQ4_NL table, against numpy reading the original GGUF\n");
+    // The oracle values in ple_oracle_vectors.inc were generated from ONE artifact: the Q2_0 original, whose table
+    // is IQ4_NL, 320001536 rows, at data_start 192, alone in its shard.  Those comparisons run when the file IS
+    // that artifact; on any other GGUF (Swift 1.5's Q8PLE table, a Q5_0 or FP8 table, the table in a shard that
+    // also holds layers) the test checks what is true of every table - the file's own geometry, that it fits, and
+    // that its rows decode to plausible numbers - and says the row oracle belongs to the Q2_0 file.
     if (!preflight_done && !table.open(gguf, err)) {
-        std::printf("  cannot open the PLE table: %s\n", err.c_str());
+        std::printf("\nB. the PLE table\n  cannot open the PLE table: %s\n", err.c_str());
         std::printf("\nple_parity: %d failures, TABLE AND BLOCK SKIPPED; partial diagnostic only\n", bad);
         return selftest || bad ? 1 : 0;
     }
-    std::printf("  %-46s %llu (expected %llu)\n", "rows", (unsigned long long) table.rows(),
-                (unsigned long long) o::kTableRows);
-    if (table.rows() != o::kTableRows) ++bad;
-
-    // The size identity is what makes the data offset FALSIFIABLE: the tensor must exactly fill the file from
-    // data_start.  Deriving the row count from the file size instead gives 320001538 rows and data_start 12,
-    // which is self-consistent and wrong.
+    const bool oracle_artifact = std::strcmp(table.format(), "IQ4_NL") == 0 && table.rows() == o::kTableRows &&
+                                 table.data_offset() == o::kTableDataStart;
+    std::printf("\nB. the PLE table (%s), against numpy reading the original GGUF\n", table.format());
     {
         const long long sz = file_size(gguf.c_str());
-        const long long need = (long long) o::kTableDataStart + (long long) table.rows() * k::PLE_ROW_BYTES;
-        const bool ok = sz == need;
-        std::printf("  %-46s %s (%lld vs %lld; data_start %llu)\n",
-                    "data_start + rows*90 == file size", ok ? "yes" : "*** NO ***", sz, need,
-                    (unsigned long long) o::kTableDataStart);
-        if (!ok) ++bad;
+        const unsigned long long rows = (unsigned long long) table.rows();
+        const unsigned long long rb = (unsigned long long) table.row_bytes();
+        const unsigned long long at = (unsigned long long) table.data_offset();
+        const unsigned long long end = at + rows * rb;
+        std::printf("  %-46s %s from %s\n", "table", table.format(), gguf.c_str());
+        std::printf("  %-46s %llu rows x %llu B at file offset %llu\n", "geometry", rows, rb, at);
+        const bool fits = sz >= 0 && end <= (unsigned long long) sz;
+        const bool exact = sz >= 0 && end == (unsigned long long) sz;
+        std::printf("  %-46s %s (table ends %llu, file %lld)\n",
+                    exact ? "the table fills the shard to its end" : "the table fits in its shard",
+                    fits ? "yes" : "*** NO ***", end, sz);
+        if (!fits) ++bad;
+        if (oracle_artifact && !exact) ++bad;   // the original's shard 2 holds the table and nothing else
+    }
+    if (!oracle_artifact) {
+        // No numpy rows exist for this file.  Every table can still be checked for a decode that is not garbage:
+        // a wrong offset, a row stride that is not the format's, or a byte-swapped scale shows up as non-finite
+        // or absurd values (a real PLE value is orders of magnitude below 1e5).
+        const uint32_t probe_rows[3] = {0u, (uint32_t) (table.rows() / 2), (uint32_t) (table.rows() - 1)},
+                       n_probe = 3;
+        int probe_bad = 0;
+        double worst = 0;
+        for (uint32_t i = 0; i < n_probe; ++i) {
+            std::vector<float> got(k::PLE_HEAD_DIM);
+            table.read_row(probe_rows[i], got.data());
+            const long long nfg = nonfinite(got.data(), k::PLE_HEAD_DIM);
+            double biggest = 0;
+            for (int d = 0; d < k::PLE_HEAD_DIM; ++d) {
+                const double a = std::fabs((double) got[d]);
+                if (a > biggest) biggest = a;
+            }
+            if (biggest > worst) worst = biggest;
+            if (nfg != 0 || !le(biggest, 1e5)) {
+                ++probe_bad;
+                std::printf("      row %u decodes to non-finite %lld, largest |v| %.3e\n", probe_rows[i], nfg, biggest);
+            }
+        }
+        std::printf("  %-46s %s (rows %u/%u/%u: largest |v| %.3e)\n", "rows decode to plausible values",
+                    probe_bad == 0 ? "yes" : "*** NO ***", probe_rows[0], probe_rows[1], probe_rows[2], worst);
+        std::printf("  %-46s this file is %s, %llu rows; the baked rows are the Q2_0 IQ4_NL artifact's\n",
+                    "row oracle", table.format(), (unsigned long long) table.rows());
+        bad += probe_bad;
     }
 
     // Read the raw bytes through the mapped table by comparing against numpy's decode of the SAME offsets.
-    // 90 BYTES AT A TIME, not the whole file - see `file_size`'s note.
-    {
+    // 90 BYTES AT A TIME, not the whole file - see `file_size`'s note.  The baked values below are the Q2_0
+    // artifact's, so this runs only when the file is that artifact (oracle_artifact above).
+    if (oracle_artifact) {
         int probe_bad = 0;
         for (int p = 0; p < o::kProbeCount; ++p) {
             const uint32_t row = o::kProbeRows[p];
             std::vector<float> got(k::PLE_HEAD_DIM);
             table.read_row(row, got.data());
             const std::vector<uint8_t> raw =
-                read_at(gguf.c_str(), (long long) o::kTableDataStart + (long long) row * k::PLE_ROW_BYTES,
-                        (size_t) k::PLE_ROW_BYTES);
-            if (raw.size() != (size_t) k::PLE_ROW_BYTES) { std::printf("  short read at row %u\n", row); ++probe_bad; continue; }
+                read_at(gguf.c_str(), (long long) (table.data_offset() + (uint64_t) row * table.row_bytes()),
+                        (size_t) table.row_bytes());
+            if (raw.size() != (size_t) table.row_bytes()) { std::printf("  short read at row %u\n", row); ++probe_bad; continue; }
             std::vector<float> ref(k::PLE_HEAD_DIM);
             k::iq4nl_dequant_row(raw.data(), ref.data());
             // the sampled values from the generator (numpy), which is the oracle proper.
@@ -564,36 +685,51 @@ int main(int argc, char** argv) {
         bad += probe_bad;
     }
 
-    // ---- the split-half nibble order must be observable ---------------------------------------------
-    {
+    // ---- the split-half nibble order must be observable (IQ4_NL tables only: the rival decoder is that
+    //      format's) ---------------------------------------------------------------------------------
+    const bool iq4nl = std::strcmp(table.format(), "IQ4_NL") == 0;
+    if (iq4nl) {
         const std::vector<uint8_t> raw =
-            read_at(gguf.c_str(), (long long) o::kTableDataStart +
-                                      (long long) o::kProbeRows[0] * k::PLE_ROW_BYTES,
-                    (size_t) k::PLE_ROW_BYTES);
+            read_at(gguf.c_str(), (long long) (table.data_offset() +
+                                               (uint64_t) o::kProbeRows[0] * table.row_bytes()),
+                    (size_t) table.row_bytes());
         std::vector<float> want(k::PLE_HEAD_DIM), inter(k::PLE_HEAD_DIM);
         k::iq4nl_dequant_row(raw.data(), want.data());
         deq_interleaved(raw.data(), inter.data());
         const double rel = rel_l1(want.data(), inter.data(), k::PLE_HEAD_DIM);
         const bool visible = gt(rel, 0.05);
-        std::printf("  %-46s %s (%.2f%% apart; generator says %.4f)\n",
-                    "split-half vs INTERLEAVED nibbles observable",
-                    visible ? "yes" : "*** NO ***", rel * 100, (double) o::kInterleavedSeparation);
+        if (oracle_artifact)
+            std::printf("  %-46s %s (%.2f%% apart; generator says %.4f)\n",
+                        "split-half vs INTERLEAVED nibbles observable",
+                        visible ? "yes" : "*** NO ***", rel * 100, (double) o::kInterleavedSeparation);
+        else
+            std::printf("  %-46s %s (%.2f%% apart)\n",
+                        "split-half vs INTERLEAVED nibbles observable", visible ? "yes" : "*** NO ***", rel * 100);
         if (!visible) ++bad;
     }
 
-    // ---- and reading at file offset 0 instead of data_start must be observable ----------------------
+    // ---- and the table must not be read from file offset 0 ------------------------------------------
     {
-        const std::vector<uint8_t> at_ds = read_at(gguf.c_str(), (long long) o::kTableDataStart,
-                                                   (size_t) k::PLE_ROW_BYTES);
-        const std::vector<uint8_t> at_0 = read_at(gguf.c_str(), 0, (size_t) k::PLE_ROW_BYTES);
-        std::vector<float> ok_v(k::PLE_HEAD_DIM), at0(k::PLE_HEAD_DIM);
-        k::iq4nl_dequant_row(at_ds.data(), ok_v.data());
-        k::iq4nl_dequant_row(at_0.data(), at0.data());
-        const double rel = rel_l1(ok_v.data(), at0.data(), k::PLE_HEAD_DIM);
-        const bool visible = gt(rel, 0.05);
-        std::printf("  %-46s %s (%.2f%% apart)\n",
-                    "data_start 192 vs file offset 0 observable", visible ? "yes" : "*** NO ***", rel * 100);
-        if (!visible) ++bad;
+        const size_t rb = (size_t) table.row_bytes();
+        const std::vector<uint8_t> at_ds = read_at(gguf.c_str(), (long long) table.data_offset(), rb);
+        const std::vector<uint8_t> at_0 = read_at(gguf.c_str(), 0, rb);
+        const bool differ = at_ds.size() == rb && at_0.size() == rb && std::memcmp(at_ds.data(), at_0.data(), rb) != 0;
+        if (iq4nl) {
+            std::vector<float> ok_v(k::PLE_HEAD_DIM), at0(k::PLE_HEAD_DIM);
+            k::iq4nl_dequant_row(at_ds.data(), ok_v.data());
+            k::iq4nl_dequant_row(at_0.data(), at0.data());
+            const double rel = rel_l1(ok_v.data(), at0.data(), k::PLE_HEAD_DIM);
+            const bool visible = gt(rel, 0.05);
+            std::printf("  %-46s %s (offset %llu vs 0: %.2f%% apart)\n",
+                        "the table is not read from file offset 0", visible ? "yes" : "*** NO ***",
+                        (unsigned long long) table.data_offset(), rel * 100);
+            if (!visible) ++bad;
+        } else {
+            std::printf("  %-46s %s (offset %llu vs 0: bytes differ %s)\n",
+                        "the table is not read from file offset 0", differ ? "yes" : "*** NO ***",
+                        (unsigned long long) table.data_offset(), differ ? "yes" : "no");
+            if (!differ) ++bad;
+        }
     }
 
     // ---- head-slowest flatten ----------------------------------------------------------------------
@@ -623,6 +759,11 @@ int main(int argc, char** argv) {
 
     // ============================ C. THE BLOCK ============================
     std::printf("\nC. the PLE block, against ggml's own graph (ple_in.bin / ple_out.bin)\n");
+    if (!block_missing.empty()) {
+        std::printf("  SKIPPED (parts A and B above ran):\n%s", block_missing.c_str());
+        std::printf("\nple_parity: %d failures in A and B, BLOCK SKIPPED; partial diagnostic only\n", bad);
+        return 2;
+    }
     if (!preflight_done && !load_capture(in_bin.c_str(), out_bin.c_str(), cap)) {
         std::printf("  cannot load %s / %s\n", in_bin.c_str(), out_bin.c_str());
         std::printf("\nple_parity: %d failures, BLOCK SKIPPED; partial diagnostic only\n", bad);

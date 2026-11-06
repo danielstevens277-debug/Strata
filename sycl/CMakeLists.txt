@@ -388,17 +388,40 @@ if(STRATA_SYCL_PARITY)
   else()
     message(STATUS "STRATA SYCL tests: no python3 with numpy found - iq_parity and its fixtures are not registered")
   endif()
-  # ple: real inputs (the Q2_0 shard-2 GGUF, the dense pack, the ggml capture); a missing one is a hard error INSIDE
-  # the test, as in the top-level build.  The working directory is the engine root, so the relative defaults resolve
-  # there.  Point it at your files with -DSTRATA_PLE_GGUF=<shard 2 .gguf> and -DSTRATA_PLE_FIXTURE_DIR=<dir>.
-  set(STRATA_PLE_GGUF "" CACHE FILEPATH "Q2_0 shard 2 GGUF that ple_parity reads (default: ../../Q2_0/... from the engine root)")
+  # ple: real inputs (the GGUF that holds the PLE table, the dense pack, the ggml capture).  The shard is found by
+  # tensor name, so -DSTRATA_PLE_GGUF takes a folder, any shard of the set or the shard itself, and $STRATA_PLE_GGUF
+  # is used when the cache variable is empty.  The working directory is the engine root, so a relative default
+  # resolves there.  The pack and the capture are DEV fixtures and follow iq_parity's rule: absent at configure time
+  # -> the test is not registered; present -> a missing input is a hard error inside the test, as in the top-level
+  # build.  -DSTRATA_PLE_FIXTURE_DIR=<dir> moves the capture.
+  set(STRATA_PLE_GGUF "" CACHE FILEPATH "Folder or any shard of the model whose PLE table ple_parity reads; the shard itself is found by tensor name (default: ../../Q2_0 from the engine root)")
   set(STRATA_PLE_FIXTURE_DIR "${STRATA_ROOT}/bench/micro" CACHE PATH
       "Directory containing required ple_in.bin and ple_out.bin parity fixtures")
+  # The model is the one input that is NOT a developer artifact, so its location is taken from the environment when
+  # the cache variable is empty (the same $STRATA_PLE_GGUF `strata.exe` accepts), and only then from the dev layout.
+  if(NOT STRATA_PLE_GGUF AND DEFINED ENV{STRATA_PLE_GGUF})
+    set(STRATA_PLE_GGUF "$ENV{STRATA_PLE_GGUF}")
+  endif()
   set(_ple_args --selftest --in "${STRATA_PLE_FIXTURE_DIR}/ple_in.bin" --out "${STRATA_PLE_FIXTURE_DIR}/ple_out.bin")
   if(STRATA_PLE_GGUF)
     list(APPEND _ple_args --gguf "${STRATA_PLE_GGUF}")
   endif()
-  add_test(NAME ple_parity COMMAND ple_parity ${_ple_args} WORKING_DIRECTORY ${STRATA_ROOT})
+  # The pack and the ggml capture are DEV artifacts like iq_parity's fixture directory: when they are not present the
+  # test is not registered (and the configure log says which file is missing) instead of failing every run.  When they
+  # are present, a missing or broken input is a hard error inside the test - the executable is still built either way,
+  # so `ple_parity --selftest --gguf <folder|shard>` reports on a PLE table without them.
+  set(_ple_missing "")
+  foreach(_f IN ITEMS "${STRATA_ROOT}/pack/full/dense.bin" "${STRATA_PLE_FIXTURE_DIR}/ple_in.bin"
+                      "${STRATA_PLE_FIXTURE_DIR}/ple_out.bin")
+    if(NOT EXISTS "${_f}")
+      list(APPEND _ple_missing "${_f}")
+    endif()
+  endforeach()
+  if(_ple_missing)
+    message(STATUS "STRATA SYCL tests: ple_parity is not registered, its developer fixtures are absent: ${_ple_missing}")
+  else()
+    add_test(NAME ple_parity COMMAND ple_parity ${_ple_args} WORKING_DIRECTORY ${STRATA_ROOT})
+  endif()
   # 0.1.31: the IQ kernels that decode a weight part once for every column/entry, bitwise vs the per-column ones
   # (no --selftest flag: it runs its checks by default), and the rewritten per-hit/grouped expert kernels vs the
   # previous ones, bitwise
