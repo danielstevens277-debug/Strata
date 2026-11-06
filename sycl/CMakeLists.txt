@@ -408,8 +408,19 @@ if(STRATA_SYCL_PARITY)
   # -> the test is not registered; present -> a missing input is a hard error inside the test, as in the top-level
   # build.  -DSTRATA_PLE_FIXTURE_DIR=<dir> moves the capture.
   set(STRATA_PLE_GGUF "" CACHE FILEPATH "Folder or any shard of the model whose PLE table ple_parity reads; the shard itself is found by tensor name (default: ../../Q2_0 from the engine root)")
-  set(STRATA_PLE_FIXTURE_DIR "${STRATA_ROOT}/bench/micro" CACHE PATH
-      "Directory containing required ple_in.bin and ple_out.bin parity fixtures")
+  # Empty default, resolved below: a CACHE default is frozen at the first configure, so a build tree that was
+  # configured in an older location (or a moved checkout) kept pointing the fixture search at a path that no
+  # longer exists, and the "fixtures are absent" message named it.
+  set(STRATA_PLE_FIXTURE_DIR "" CACHE PATH
+      "Directory containing required ple_in.bin and ple_out.bin parity fixtures (empty: <repo>/bench/micro)")
+  if(NOT STRATA_PLE_FIXTURE_DIR)
+    set(STRATA_PLE_FIXTURE_DIR "${STRATA_ROOT}/bench/micro")
+  elseif(NOT EXISTS "${STRATA_PLE_FIXTURE_DIR}")
+    # the old default above was baked into the cache, so an existing tree can point at a path that is gone
+    message(STATUS "STRATA SYCL tests: STRATA_PLE_FIXTURE_DIR=${STRATA_PLE_FIXTURE_DIR} does not exist - using "
+                   "${STRATA_ROOT}/bench/micro (a cache entry from an older tree; -U STRATA_PLE_FIXTURE_DIR clears it)")
+    set(STRATA_PLE_FIXTURE_DIR "${STRATA_ROOT}/bench/micro")
+  endif()
   # The model is the one input that is NOT a developer artifact, so its location is taken from the environment when
   # the cache variable is empty (the same $STRATA_PLE_GGUF `strata.exe` accepts), and only then from the dev layout.
   if(NOT STRATA_PLE_GGUF AND DEFINED ENV{STRATA_PLE_GGUF})
